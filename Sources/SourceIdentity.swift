@@ -58,3 +58,22 @@ enum SourceIdentity {
         sourceKey == legacyKey(url: url, variant: variant)
     }
 }
+
+/// Keeps the source filename separate from the current library path.
+///
+/// The raw filename is retained for provenance. The key is only a candidate
+/// lookup value; file identity is still established by the verified SHA-256.
+enum FilenameIdentity {
+    static func rawFilename(for url: URL) -> String? {
+        let filename = url.lastPathComponent
+        guard !filename.isEmpty, filename != ".", filename != ".." else { return nil }
+        return filename
+    }
+
+    static func key(for filename: String?) -> String? {
+        guard let filename else { return nil }
+        let basename = URL(fileURLWithPath: filename).lastPathComponent
+        guard !basename.isEmpty, basename != ".", basename != ".." else { return nil }
+        return basename.precomposedStringWithCanonicalMapping.lowercased()
+    }
+}

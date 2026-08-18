@@ -32,6 +32,27 @@ enum AssetVariant: String, CaseIterable, Codable, Sendable {
     case movie = "動画"
 }
 
+/// A reference to a file exposed by ImageCaptureCore. The framework objects
+/// themselves are deliberately kept out of PhotoGroup because they are not
+/// Sendable and cannot be used safely by the scanner or transfer workers.
+struct CameraAssetReference: Hashable, Sendable {
+    let identifier: String
+    let filename: String
+    let variant: AssetVariant
+    let fileSize: Int64
+    let captureDate: Date?
+}
+
+struct CameraPhotoReference: Hashable, Sendable {
+    let cameraID: String
+    let groupKey: String
+    let assets: [CameraAssetReference]
+
+    func asset(for variant: AssetVariant) -> CameraAssetReference? {
+        assets.first { $0.variant == variant }
+    }
+}
+
 enum PhotoImportState: String, CaseIterable, Hashable, Identifiable, Sendable {
     case notImported
     case partial
@@ -222,6 +243,10 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
     /// Finder move and may be shared by an explicit library-to-library copy.
     var photoID: String?
     var labels: [PhotoLabel]
+    /// Non-filesystem assets reported by a USB camera through
+    /// ImageCaptureCore. The live ICCameraFile objects are owned by
+    /// CameraMonitor and looked up by the identifiers in this value.
+    var cameraReference: CameraPhotoReference?
     /// Stable order assigned by the lightweight directory scan. Detailed
     /// metadata may update captureDate later, but must not move an already
     /// visible photo within its day.
@@ -242,6 +267,7 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
         libraryAssetStatus: LibraryAssetStatus = .notApplicable,
         photoID: String? = nil,
         labels: [PhotoLabel] = [],
+        cameraReference: CameraPhotoReference? = nil,
         presentationOrder: Int = 0
     ) {
         self.id = id
@@ -258,6 +284,7 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
         self.libraryAssetStatus = libraryAssetStatus
         self.photoID = photoID
         self.labels = labels
+        self.cameraReference = cameraReference
         self.presentationOrder = presentationOrder
     }
 
@@ -275,6 +302,8 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
 
     var primaryURL: URL? { jpegURL ?? rawURL ?? movieURL }
 
+    var isCameraBacked: Bool { cameraReference != nil }
+
     func url(for variant: AssetVariant) -> URL? {
         switch variant {
         case .jpeg: return jpegURL
@@ -288,7 +317,16 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
         if jpegURL != nil { result.append(.jpeg) }
         if rawURL != nil { result.append(.raw) }
         if movieURL != nil { result.append(.movie) }
+        if let cameraReference {
+            for variant in AssetVariant.allCases where cameraReference.asset(for: variant) != nil {
+                if !result.contains(variant) { result.append(variant) }
+            }
+        }
         return result
+    }
+
+    var importableVariants: [AssetVariant] {
+        variants.filter { $0 == .jpeg || $0 == .raw }
     }
 
     var dateKey: String {
@@ -297,13 +335,16 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
     }
 
     var cardImportState: PhotoImportState {
-        let available = [jpegURL, rawURL].compactMap { $0 }.count
+        let available = importableVariants.count
         guard available > 0 else { return .notApplicable }
 
-        let imported = [
-            jpegURL != nil && importedJPEG,
-            rawURL != nil && importedRAW
-        ].filter { $0 }.count
+        let imported = importableVariants.filter { variant in
+            switch variant {
+            case .jpeg: return importedJPEG
+            case .raw: return importedRAW
+            case .movie: return false
+            }
+        }.count
         if imported == 0 { return .notImported }
         if imported == available { return .imported }
         return .partial

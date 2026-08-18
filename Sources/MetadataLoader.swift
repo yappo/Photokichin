@@ -29,13 +29,15 @@ final class MetadataLoadingCoordinator {
     private final class Request {
         let id = UUID()
         let group: PhotoGroup
+        let loader: @Sendable (TaskPriority) async -> PhotoMetadata?
         var priority: MetadataRequestPriority
         var sequence: UInt64
         var observers: [UUID: (PhotoMetadata?) -> Void] = [:]
         var task: Task<PhotoMetadata?, Never>?
 
-        init(group: PhotoGroup, priority: MetadataRequestPriority, sequence: UInt64) {
+        init(group: PhotoGroup, priority: MetadataRequestPriority, sequence: UInt64, loader: @escaping @Sendable (TaskPriority) async -> PhotoMetadata?) {
             self.group = group
+            self.loader = loader
             self.priority = priority
             self.sequence = sequence
         }
@@ -74,6 +76,7 @@ final class MetadataLoadingCoordinator {
     func enqueue(
         group: PhotoGroup,
         priority: MetadataRequestPriority,
+        loader: (@Sendable (TaskPriority) async -> PhotoMetadata?)? = nil,
         onMetadata: @escaping (PhotoMetadata?) -> Void
     ) -> UUID? {
         guard !quiescing else { return nil }
@@ -82,9 +85,16 @@ final class MetadataLoadingCoordinator {
             return nil
         }
 
-        guard group.primaryURL != nil else {
+        guard loader != nil || group.primaryURL != nil else {
             onMetadata(nil)
             return nil
+        }
+
+        let metadataLoader: @Sendable (TaskPriority) async -> PhotoMetadata? = loader ?? { taskPriority in
+            let urls = [group.jpegURL, group.rawURL].compactMap { $0 }
+            return await Task.detached(priority: taskPriority) {
+                urls.lazy.compactMap { ImageIOReader.readMetadata(url: $0) }.first
+            }.value
         }
 
         let observationID = UUID()
@@ -103,7 +113,7 @@ final class MetadataLoadingCoordinator {
             promote(request, priority: effectivePriority)
             queueNeedsSort = true
         } else {
-            request = Request(group: group, priority: effectivePriority, sequence: nextSequence)
+            request = Request(group: group, priority: effectivePriority, sequence: nextSequence, loader: metadataLoader)
             queued.append(request)
             queuedByGroupID[group.id] = request
             queueNeedsSort = true
@@ -246,10 +256,7 @@ final class MetadataLoadingCoordinator {
             guard !request.observers.isEmpty else { continue }
             active[request.group.id] = request
 
-            let urls = [request.group.jpegURL, request.group.rawURL].compactMap { $0 }
-            let task = Task.detached(priority: request.priority.taskPriority) {
-                urls.lazy.compactMap { ImageIOReader.readMetadata(url: $0) }.first
-            }
+            let task = Task { await request.loader(request.priority.taskPriority) }
             request.task = task
             let requestID = request.id
             let groupID = request.group.id

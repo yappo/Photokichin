@@ -129,10 +129,35 @@ struct ImageIOReader {
             return nil
         }
 
-        let exif = properties["{Exif}"] as? [String: Any] ?? [:]
-        let tiff = properties["{TIFF}"] as? [String: Any] ?? [:]
-        let maker = properties["{MakerCanon}"] as? [String: Any] ?? [:]
-        let gps = properties["{GPS}"] as? [String: Any] ?? [:]
+        return readMetadata(dictionary: properties)
+    }
+
+    /// Parses the same ImageIO-style property dictionary returned by
+    /// ImageCaptureCore's ICCameraFile metadata request.
+    static func readMetadata(properties: [AnyHashable: Any]) -> PhotoMetadata? {
+        let dictionary = properties.reduce(into: [String: Any]()) { result, entry in
+            result[String(describing: entry.key)] = entry.value
+        }
+        return readMetadata(dictionary: dictionary)
+    }
+
+    private static func readMetadata(dictionary properties: [String: Any]) -> PhotoMetadata? {
+        func nestedDictionary(_ value: Any?) -> [String: Any] {
+            if let dictionary = value as? [String: Any] {
+                return dictionary
+            }
+            if let dictionary = value as? [AnyHashable: Any] {
+                return dictionary.reduce(into: [String: Any]()) { result, entry in
+                    result[String(describing: entry.key)] = entry.value
+                }
+            }
+            return [:]
+        }
+
+        let exif = nestedDictionary(properties["{Exif}"])
+        let tiff = nestedDictionary(properties["{TIFF}"])
+        let maker = nestedDictionary(properties["{MakerCanon}"])
+        let gps = nestedDictionary(properties["{GPS}"])
 
         let dateString = (exif["DateTimeOriginal"] as? String) ?? (exif["DateTimeDigitized"] as? String)
         let date = parseExifDate(dateString)

@@ -8,6 +8,8 @@ struct CatalogImportRecord: Sendable {
     let destinationURL: URL
     let sha256: String
     let fileSize: Int64
+    let sourceFilename: String?
+    let sourceFilenameKey: String?
     let legacySourceKey: String?
     let sourceVolumeUUID: String?
     let sourceRelativePath: String?
@@ -19,6 +21,8 @@ struct CatalogImportRecord: Sendable {
         destinationURL: URL,
         sha256: String,
         fileSize: Int64,
+        sourceFilename: String? = nil,
+        sourceFilenameKey: String? = nil,
         legacySourceKey: String? = nil,
         sourceVolumeUUID: String? = nil,
         sourceRelativePath: String? = nil,
@@ -29,6 +33,8 @@ struct CatalogImportRecord: Sendable {
         self.destinationURL = destinationURL
         self.sha256 = sha256
         self.fileSize = fileSize
+        self.sourceFilename = sourceFilename
+        self.sourceFilenameKey = sourceFilenameKey ?? FilenameIdentity.key(for: sourceFilename)
         self.legacySourceKey = legacySourceKey
         self.sourceVolumeUUID = sourceVolumeUUID
         self.sourceRelativePath = sourceRelativePath
@@ -76,6 +82,14 @@ struct CatalogContentRecord: Sendable {
     let fileSize: Int64
 }
 
+struct CatalogMatchCandidate: Sendable, Equatable {
+    let path: URL
+    let variant: AssetVariant
+    let fileSize: Int64
+    let sha256: String
+    let filenameKey: String?
+}
+
 final class CatalogStore: @unchecked Sendable {
     private struct ImportedRow {
         let sourceKey: String
@@ -93,6 +107,7 @@ final class CatalogStore: @unchecked Sendable {
         let path: URL
         let sha256: String
         let fileSize: Int64
+        let filenameKey: String
     }
 
     let catalogURL: URL
@@ -212,6 +227,70 @@ final class CatalogStore: @unchecked Sendable {
         return nil
     }
 
+    /// Returns metadata-only candidates for a camera item. This never reads
+    /// the photo bytes and does not establish identity; the downloaded camera
+    /// file must still be verified by SHA-256.
+    func matchCandidates(fileSize: Int64, variant: AssetVariant) -> [CatalogMatchCandidate] {
+        lock.lock(); defer { lock.unlock() }
+        var result: [CatalogMatchCandidate] = []
+        let queries = [
+            ("SELECT destination_path, sha256, file_size, source_filename_key FROM imported_files WHERE file_size = ? AND variant = ?;", false),
+            ("SELECT path, sha256, file_size, filename_key FROM library_assets WHERE file_size = ? AND variant = ?;", true)
+        ]
+        for (query, _) in queries {
+            guard let statement = prepare(query) else { continue }
+            sqlite3_bind_int64(statement, 1, fileSize)
+            bind(variant.rawValue, to: statement, at: 2)
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let path = text(statement, column: 0),
+                  let sha256 = text(statement, column: 1) {
+                result.append(CatalogMatchCandidate(
+                    path: URL(fileURLWithPath: path),
+                    variant: variant,
+                    fileSize: sqlite3_column_int64(statement, 2),
+                    sha256: sha256,
+                    filenameKey: text(statement, column: 3)
+                ))
+            }
+            sqlite3_finalize(statement)
+        }
+        return result
+    }
+
+    /// Finds an existing library file whose current bytes match a verified
+    /// camera download. Stored hashes narrow the candidates; the existing
+    /// file is hashed again before reuse so a stale catalog row is not enough
+    /// to establish identity.
+    func existingContentDestination(sha256: String, variant: AssetVariant, fileSize: Int64) -> URL? {
+        guard !sha256.isEmpty else { return nil }
+        let paths: [URL] = {
+            lock.lock(); defer { lock.unlock() }
+            var result: [URL] = []
+            let queries = [
+                "SELECT destination_path FROM imported_files WHERE sha256 = ? AND variant = ? AND file_size = ?;",
+                "SELECT path FROM library_assets WHERE sha256 = ? AND variant = ? AND file_size = ?;"
+            ]
+            for query in queries {
+                guard let statement = prepare(query) else { continue }
+                bind(sha256, to: statement, at: 1)
+                bind(variant.rawValue, to: statement, at: 2)
+                sqlite3_bind_int64(statement, 3, fileSize)
+                while sqlite3_step(statement) == SQLITE_ROW,
+                      let path = text(statement, column: 0) {
+                    result.append(URL(fileURLWithPath: path).standardizedFileURL)
+                }
+                sqlite3_finalize(statement)
+            }
+            return Array(Set(result))
+        }()
+
+        for path in paths where FileManager.default.fileExists(atPath: path.path) {
+            guard (try? self.fileSize(path)) == fileSize else { continue }
+            if (try? hashFile(path)) == sha256 { return path }
+        }
+        return nil
+    }
+
     func recordLibraryAsset(
         url: URL,
         variant: AssetVariant,
@@ -228,12 +307,14 @@ final class CatalogStore: @unchecked Sendable {
 
         let now = Date().timeIntervalSince1970
         let photoID = try resolvePhotoIDLocked(for: url, preferredPhotoID: preferredPhotoID)
+        let filenameKey = FilenameIdentity.key(for: url.lastPathComponent) ?? ""
         let sql = """
-        INSERT INTO library_assets(asset_key, variant, photo_id, path, sha256, file_size, registered_at, last_verified_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO library_assets(asset_key, variant, photo_id, path, filename_key, sha256, file_size, registered_at, last_verified_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(asset_key) DO UPDATE SET
           photo_id = excluded.photo_id,
           path = excluded.path,
+          filename_key = excluded.filename_key,
           sha256 = excluded.sha256,
           file_size = excluded.file_size,
           last_verified_at = excluded.last_verified_at;
@@ -244,10 +325,11 @@ final class CatalogStore: @unchecked Sendable {
         bind(variant.rawValue, to: statement, at: 2)
         bind(photoID, to: statement, at: 3)
         bind(url.standardizedFileURL.path, to: statement, at: 4)
-        bind(sha256, to: statement, at: 5)
-        sqlite3_bind_int64(statement, 6, fileSize)
-        sqlite3_bind_double(statement, 7, now)
-        if sha256.isEmpty { sqlite3_bind_null(statement, 8) } else { sqlite3_bind_double(statement, 8, now) }
+        bind(filenameKey, to: statement, at: 5)
+        bind(sha256, to: statement, at: 6)
+        sqlite3_bind_int64(statement, 7, fileSize)
+        sqlite3_bind_double(statement, 8, now)
+        if sha256.isEmpty { sqlite3_bind_null(statement, 9) } else { sqlite3_bind_double(statement, 9, now) }
         guard sqlite3_step(statement) == SQLITE_DONE,
               sqlite3_exec(database, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
             throw AppError.cannotOpenCatalog(catalogURL)
@@ -255,9 +337,9 @@ final class CatalogStore: @unchecked Sendable {
         committed = true
     }
 
-    func recordImport(sourceKey: String, variant: AssetVariant, destinationURL: URL, sha256: String) throws {
+    func recordImport(sourceKey: String, variant: AssetVariant, destinationURL: URL, sha256: String, sourceFilename: String? = nil) throws {
         let size = try fileSize(destinationURL)
-        try recordImports([CatalogImportRecord(sourceKey: sourceKey, variant: variant, destinationURL: destinationURL, sha256: sha256, fileSize: size)])
+        try recordImports([CatalogImportRecord(sourceKey: sourceKey, variant: variant, destinationURL: destinationURL, sha256: sha256, fileSize: size, sourceFilename: sourceFilename)])
     }
 
     func recordImports(_ records: [CatalogImportRecord]) throws {
@@ -270,12 +352,14 @@ final class CatalogStore: @unchecked Sendable {
         defer { if !committed { sqlite3_exec(database, "ROLLBACK;", nil, nil, nil) } }
 
         let sql = """
-        INSERT INTO imported_files(source_key, variant, photo_id, source_volume_uuid, source_relative_path, destination_path, sha256, file_size, imported_at, last_verified_at, file_state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present')
+        INSERT INTO imported_files(source_key, variant, photo_id, source_volume_uuid, source_relative_path, source_filename, source_filename_key, destination_path, sha256, file_size, imported_at, last_verified_at, file_state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present')
         ON CONFLICT(source_key, variant) DO UPDATE SET
           photo_id = excluded.photo_id,
           source_volume_uuid = excluded.source_volume_uuid,
           source_relative_path = excluded.source_relative_path,
+          source_filename = COALESCE(excluded.source_filename, imported_files.source_filename),
+          source_filename_key = COALESCE(excluded.source_filename_key, imported_files.source_filename_key),
           destination_path = excluded.destination_path,
           sha256 = excluded.sha256,
           file_size = excluded.file_size,
@@ -294,11 +378,13 @@ final class CatalogStore: @unchecked Sendable {
             bind(photoID, to: statement, at: 3)
             bindOptional(record.sourceVolumeUUID, to: statement, at: 4)
             bindOptional(record.sourceRelativePath, to: statement, at: 5)
-            bind(record.destinationURL.standardizedFileURL.path, to: statement, at: 6)
-            bind(record.sha256, to: statement, at: 7)
-            sqlite3_bind_int64(statement, 8, record.fileSize)
-            sqlite3_bind_double(statement, 9, now)
-            sqlite3_bind_double(statement, 10, now)
+            bindOptional(record.sourceFilename, to: statement, at: 6)
+            bindOptional(record.sourceFilenameKey, to: statement, at: 7)
+            bind(record.destinationURL.standardizedFileURL.path, to: statement, at: 8)
+            bind(record.sha256, to: statement, at: 9)
+            sqlite3_bind_int64(statement, 10, record.fileSize)
+            sqlite3_bind_double(statement, 11, now)
+            sqlite3_bind_double(statement, 12, now)
             guard sqlite3_step(statement) == SQLITE_DONE else { throw AppError.cannotOpenCatalog(catalogURL) }
             resolveIssues(sourceKey: record.sourceKey, variant: record.variant, legacySourceKey: record.legacySourceKey)
         }
@@ -316,9 +402,9 @@ final class CatalogStore: @unchecked Sendable {
         var committed = false
         defer { if !committed { sqlite3_exec(database, "ROLLBACK;", nil, nil, nil) } }
         let sql = """
-        INSERT INTO library_assets(asset_key, variant, photo_id, path, sha256, file_size, registered_at, last_verified_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(asset_key) DO UPDATE SET photo_id=excluded.photo_id, path=excluded.path, sha256=excluded.sha256, file_size=excluded.file_size, last_verified_at=excluded.last_verified_at;
+        INSERT INTO library_assets(asset_key, variant, photo_id, path, filename_key, sha256, file_size, registered_at, last_verified_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(asset_key) DO UPDATE SET photo_id=excluded.photo_id, path=excluded.path, filename_key=excluded.filename_key, sha256=excluded.sha256, file_size=excluded.file_size, last_verified_at=excluded.last_verified_at;
         """
         guard let statement = prepare(sql) else { throw AppError.cannotOpenCatalog(catalogURL) }
         defer { sqlite3_finalize(statement) }
@@ -327,14 +413,16 @@ final class CatalogStore: @unchecked Sendable {
             guard FileManager.default.fileExists(atPath: url.path), let hash = try? hashFile(url), let size = try? fileSize(url) else { continue }
             sqlite3_reset(statement); sqlite3_clear_bindings(statement)
             let photoID = try resolvePhotoIDLocked(for: url, preferredPhotoID: preferredPhotoID)
+            let filenameKey = FilenameIdentity.key(for: url.lastPathComponent) ?? ""
             bind(assetKey(path: url, variant: variant), to: statement, at: 1)
             bind(variant.rawValue, to: statement, at: 2)
             bind(photoID, to: statement, at: 3)
             bind(url.standardizedFileURL.path, to: statement, at: 4)
-            bind(hash, to: statement, at: 5)
-            sqlite3_bind_int64(statement, 6, size)
-            sqlite3_bind_double(statement, 7, now)
+            bind(filenameKey, to: statement, at: 5)
+            bind(hash, to: statement, at: 6)
+            sqlite3_bind_int64(statement, 7, size)
             sqlite3_bind_double(statement, 8, now)
+            sqlite3_bind_double(statement, 9, now)
             guard sqlite3_step(statement) == SQLITE_DONE else { throw AppError.cannotOpenCatalog(catalogURL) }
         }
         guard sqlite3_exec(database, "COMMIT;", nil, nil, nil) == SQLITE_OK else { throw AppError.cannotOpenCatalog(catalogURL) }
@@ -443,7 +531,8 @@ final class CatalogStore: @unchecked Sendable {
         let photoID: String?
         if issue.sourceKey.hasPrefix("library:") {
             photoID = singleText("SELECT photo_id FROM library_assets WHERE asset_key = ? LIMIT 1;", value: issue.sourceKey)
-            try exec("UPDATE library_assets SET path = ?, last_verified_at = ? WHERE asset_key = ?;", bindings: [.text(candidateURL.path), .double(now), .text(issue.sourceKey)])
+            let filenameKey = FilenameIdentity.key(for: candidateURL.lastPathComponent) ?? ""
+            try exec("UPDATE library_assets SET path = ?, filename_key = ?, last_verified_at = ? WHERE asset_key = ?;", bindings: [.text(candidateURL.path), .text(filenameKey), .double(now), .text(issue.sourceKey)])
         } else {
             photoID = singleText("SELECT photo_id FROM imported_files WHERE source_key = ? AND variant = ? LIMIT 1;", values: [issue.sourceKey, issue.variant.rawValue])
             try exec("UPDATE imported_files SET destination_path = ?, file_state = 'moved', last_verified_at = ? WHERE source_key = ? AND variant = ?;", bindings: [.text(candidateURL.path), .double(now), .text(issue.sourceKey), .text(issue.variant.rawValue)])
@@ -695,6 +784,8 @@ final class CatalogStore: @unchecked Sendable {
           photo_id TEXT NOT NULL,
           source_volume_uuid TEXT,
           source_relative_path TEXT,
+          source_filename TEXT,
+          source_filename_key TEXT,
           destination_path TEXT NOT NULL,
           sha256 TEXT NOT NULL,
           file_size INTEGER NOT NULL DEFAULT 0,
@@ -708,6 +799,7 @@ final class CatalogStore: @unchecked Sendable {
           variant TEXT NOT NULL,
           photo_id TEXT NOT NULL,
           path TEXT NOT NULL,
+          filename_key TEXT NOT NULL DEFAULT '',
           sha256 TEXT NOT NULL,
           file_size INTEGER NOT NULL DEFAULT 0,
           registered_at REAL NOT NULL,
@@ -763,14 +855,26 @@ final class CatalogStore: @unchecked Sendable {
         """
         guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else { throw AppError.cannotOpenCatalog(catalogURL) }
         try exec("CREATE INDEX IF NOT EXISTS imported_files_volume_relative_idx ON imported_files(source_volume_uuid, source_relative_path, variant);")
-        try exec("INSERT INTO catalog_meta(key, value) VALUES ('schema_version', '2');")
+        try exec("CREATE INDEX IF NOT EXISTS imported_files_size_filename_idx ON imported_files(file_size, source_filename_key);")
+        try exec("CREATE INDEX IF NOT EXISTS library_assets_size_filename_idx ON library_assets(file_size, filename_key);")
+        try exec("CREATE INDEX IF NOT EXISTS imported_files_sha256_idx ON imported_files(sha256) WHERE sha256 <> '';")
+        try exec("CREATE INDEX IF NOT EXISTS library_assets_sha256_idx ON library_assets(sha256) WHERE sha256 <> '';")
+        try exec("INSERT INTO catalog_meta(key, value) VALUES ('schema_version', '3');")
     }
 
     private func validateCurrentSchema() throws {
-        guard meta("schema_version") == "2",
+        guard ["2", "3"].contains(meta("schema_version")),
               inspectSchema("imported_files").contains("photo_id"),
               inspectSchema("library_assets").contains("photo_id"),
               !inspectSchema("labels").isEmpty else {
+            throw AppError.catalogMigrationRequired(catalogURL)
+        }
+        if meta("schema_version") == "2" {
+            try migrateFilenameSchema()
+        }
+        guard inspectSchema("imported_files").contains("source_filename"),
+              inspectSchema("imported_files").contains("source_filename_key"),
+              inspectSchema("library_assets").contains("filename_key") else {
             throw AppError.catalogMigrationRequired(catalogURL)
         }
         guard count("SELECT COUNT(*) FROM imported_files WHERE photo_id IS NULL OR photo_id = '';") == 0,
@@ -778,6 +882,50 @@ final class CatalogStore: @unchecked Sendable {
             throw AppError.catalogMigrationRequired(catalogURL)
         }
         try exec("PRAGMA foreign_keys = ON;")
+    }
+
+    private func migrateFilenameSchema() throws {
+        try beginTransactionLocked()
+        do {
+            let importedColumns = inspectSchema("imported_files")
+            let libraryColumns = inspectSchema("library_assets")
+            if !importedColumns.contains("source_filename") {
+                try exec("ALTER TABLE imported_files ADD COLUMN source_filename TEXT;")
+            }
+            if !importedColumns.contains("source_filename_key") {
+                try exec("ALTER TABLE imported_files ADD COLUMN source_filename_key TEXT;")
+            }
+            if !libraryColumns.contains("filename_key") {
+                try exec("ALTER TABLE library_assets ADD COLUMN filename_key TEXT NOT NULL DEFAULT '';")
+            }
+
+            guard let statement = prepare("SELECT asset_key, path FROM library_assets;") else {
+                throw AppError.cannotOpenCatalog(catalogURL)
+            }
+            var assets: [(String, String)] = []
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let assetKey = text(statement, column: 0),
+                  let path = text(statement, column: 1) {
+                assets.append((assetKey, path))
+            }
+            sqlite3_finalize(statement)
+            for (assetKey, path) in assets {
+                try exec(
+                    "UPDATE library_assets SET filename_key = ? WHERE asset_key = ?;",
+                    bindings: [.text(FilenameIdentity.key(for: URL(fileURLWithPath: path).lastPathComponent) ?? ""), .text(assetKey)]
+                )
+            }
+
+            try exec("CREATE INDEX IF NOT EXISTS imported_files_size_filename_idx ON imported_files(file_size, source_filename_key);")
+            try exec("CREATE INDEX IF NOT EXISTS library_assets_size_filename_idx ON library_assets(file_size, filename_key);")
+            try exec("CREATE INDEX IF NOT EXISTS imported_files_sha256_idx ON imported_files(sha256) WHERE sha256 <> '';")
+            try exec("CREATE INDEX IF NOT EXISTS library_assets_sha256_idx ON library_assets(sha256) WHERE sha256 <> '';")
+            try exec("UPDATE catalog_meta SET value = '3' WHERE key = 'schema_version';")
+            try commitTransactionLocked()
+        } catch {
+            sqlite3_exec(database, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
     }
 
     private func inspectSchema(_ table: String) -> Set<String> {
@@ -816,7 +964,7 @@ final class CatalogStore: @unchecked Sendable {
     }
 
     private func libraryAssetRows() -> [LibraryAssetRow] {
-        guard let statement = prepare("SELECT asset_key, variant, path, sha256, file_size FROM library_assets;") else { return [] }
+        guard let statement = prepare("SELECT asset_key, variant, path, sha256, file_size, filename_key FROM library_assets;") else { return [] }
         defer { sqlite3_finalize(statement) }
         var rows: [LibraryAssetRow] = []
         while sqlite3_step(statement) == SQLITE_ROW,
@@ -824,7 +972,7 @@ final class CatalogStore: @unchecked Sendable {
               let variant = text(statement, column: 1).flatMap(AssetVariant.init(rawValue:)),
               let path = text(statement, column: 2),
               let sha = text(statement, column: 3) {
-            rows.append(LibraryAssetRow(assetKey: assetKey, variant: variant, path: URL(fileURLWithPath: path), sha256: sha, fileSize: sqlite3_column_int64(statement, 4)))
+            rows.append(LibraryAssetRow(assetKey: assetKey, variant: variant, path: URL(fileURLWithPath: path), sha256: sha, fileSize: sqlite3_column_int64(statement, 4), filenameKey: text(statement, column: 5) ?? ""))
         }
         return rows
     }

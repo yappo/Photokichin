@@ -354,6 +354,7 @@ final class ThumbnailLoader: ObservableObject {
     @Published private(set) var isLoading = false
 
     private var observationID: UUID?
+    private var cameraObservationID: UUID?
     private var loadedKey: String?
 
     func load(
@@ -362,6 +363,35 @@ final class ThumbnailLoader: ObservableObject {
         priority: ThumbnailRequestPriority = .visible,
         onFinished: @escaping () -> Void = {}
     ) {
+        if group.isCameraBacked {
+            let key = "camera:\(group.id):\(maxPixel)"
+            if loadedKey == key {
+                if !isLoading { onFinished() }
+                return
+            }
+
+            cancel()
+            loadedKey = key
+            image = nil
+            isLoading = true
+            cameraObservationID = CameraThumbnailCoordinator.shared.subscribe(
+                group: group,
+                maxPixel: maxPixel,
+                priority: priority
+            ) { [weak self] image in
+                guard let self else { return }
+                if let image { self.image = image }
+                self.isLoading = false
+                self.cameraObservationID = nil
+                onFinished()
+            }
+            if cameraObservationID == nil {
+                isLoading = false
+                onFinished()
+            }
+            return
+        }
+
         guard let url = group.primaryURL else { return }
         let key = url.path + ":" + String(maxPixel)
         if loadedKey == key {
@@ -403,7 +433,11 @@ final class ThumbnailLoader: ObservableObject {
         if let observationID {
             ThumbnailLoadingCoordinator.shared.cancel(observationID)
         }
+        if let cameraObservationID {
+            CameraThumbnailCoordinator.shared.cancel(cameraObservationID)
+        }
         observationID = nil
+        cameraObservationID = nil
         loadedKey = nil
         isLoading = false
     }
