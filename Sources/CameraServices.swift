@@ -1,6 +1,122 @@
 import AppKit
 import Foundation
+import os
 @preconcurrency import ImageCaptureCore
+
+/// Tracks whether ImageCaptureCore asked for work that Photokichin did not
+/// explicitly request. The counters are intentionally observable in the
+/// unified log so a camera run can verify that preflight work was skipped.
+private final class CameraRequestGate: @unchecked Sendable {
+    static let shared = CameraRequestGate()
+
+    private enum RequestKind {
+        case thumbnail
+        case metadata
+    }
+
+    private let lock = NSLock()
+    private let logger = Logger(subsystem: "jp.yappo.Photokichin", category: "camera-io")
+    private var explicitThumbnailRequests = 0
+    private var explicitMetadataRequests = 0
+    private var allowedThumbnails = 0
+    private var deniedThumbnails = 0
+    private var allowedMetadata = 0
+    private var deniedMetadata = 0
+
+    private var thumbnailRequests: [ObjectIdentifier: Int] = [:]
+    private var metadataRequests: [ObjectIdentifier: Int] = [:]
+
+    func beginThumbnail(_ item: ICCameraItem) {
+        lock.lock()
+        let id = ObjectIdentifier(item)
+        thumbnailRequests[id, default: 0] += 1
+        explicitThumbnailRequests += 1
+        let explicitCount = explicitThumbnailRequests
+        lock.unlock()
+        logger.info("camera_io explicit_thumbnail_begin count=\(explicitCount, privacy: .public)")
+    }
+
+    func endThumbnail(_ item: ICCameraItem) {
+        lock.lock()
+        decrement(ObjectIdentifier(item), in: &thumbnailRequests)
+        lock.unlock()
+    }
+
+    func beginMetadata(_ item: ICCameraItem) {
+        lock.lock()
+        let id = ObjectIdentifier(item)
+        metadataRequests[id, default: 0] += 1
+        explicitMetadataRequests += 1
+        let explicitCount = explicitMetadataRequests
+        lock.unlock()
+        logger.info("camera_io explicit_metadata_begin count=\(explicitCount, privacy: .public)")
+    }
+
+    func endMetadata(_ item: ICCameraItem) {
+        lock.lock()
+        decrement(ObjectIdentifier(item), in: &metadataRequests)
+        lock.unlock()
+    }
+
+    func allowsThumbnail(_ item: ICCameraItem) -> Bool {
+        let (allowed, allowedCount, deniedCount, explicitCount) = recordDecision(item: item, kind: .thumbnail)
+        if allowed || deniedCount <= 3 || deniedCount.isMultiple(of: 1000) {
+            let decision = allowed ? 1 : 0
+            logger.notice("camera_io delegate_thumbnail decision=\(decision, privacy: .public) allowed=\(allowedCount, privacy: .public) denied=\(deniedCount, privacy: .public) explicit=\(explicitCount, privacy: .public)")
+        }
+        return allowed
+    }
+
+    func allowsMetadata(_ item: ICCameraItem) -> Bool {
+        let (allowed, allowedCount, deniedCount, explicitCount) = recordDecision(item: item, kind: .metadata)
+        if allowed || deniedCount <= 3 || deniedCount.isMultiple(of: 1000) {
+            let decision = allowed ? 1 : 0
+            logger.notice("camera_io delegate_metadata decision=\(decision, privacy: .public) allowed=\(allowedCount, privacy: .public) denied=\(deniedCount, privacy: .public) explicit=\(explicitCount, privacy: .public)")
+        }
+        return allowed
+    }
+
+    func logSessionReady(elapsed: TimeInterval, mediaFileCount: Int, catalogPercent: Int) {
+        logger.notice("camera_io session_ready elapsed_seconds=\(elapsed, privacy: .public) media_files=\(mediaFileCount, privacy: .public) catalog_percent=\(catalogPercent, privacy: .public)")
+    }
+
+    private func recordDecision(
+        item: ICCameraItem,
+        kind: RequestKind
+    ) -> (Bool, Int, Int, Int) {
+        lock.lock()
+        let itemID = ObjectIdentifier(item)
+        let allowed: Bool
+        let allowedCount: Int
+        let deniedCount: Int
+        let explicitCount: Int
+        switch kind {
+        case .thumbnail:
+            allowed = thumbnailRequests[itemID, default: 0] > 0
+            if allowed { allowedThumbnails += 1 } else { deniedThumbnails += 1 }
+            allowedCount = allowedThumbnails
+            deniedCount = deniedThumbnails
+            explicitCount = explicitThumbnailRequests
+        case .metadata:
+            allowed = metadataRequests[itemID, default: 0] > 0
+            if allowed { allowedMetadata += 1 } else { deniedMetadata += 1 }
+            allowedCount = allowedMetadata
+            deniedCount = deniedMetadata
+            explicitCount = explicitMetadataRequests
+        }
+        lock.unlock()
+        return (allowed, allowedCount, deniedCount, explicitCount)
+    }
+
+    private func decrement(_ id: ObjectIdentifier, in counts: inout [ObjectIdentifier: Int]) {
+        guard let count = counts[id] else { return }
+        if count <= 1 {
+            counts.removeValue(forKey: id)
+        } else {
+            counts[id] = count - 1
+        }
+    }
+}
 
 enum CameraConnectionState: Hashable, Sendable {
     case detected
@@ -71,6 +187,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
 
     @Published private(set) var cameras: [CameraDescriptor] = []
     private let browser = ICDeviceBrowser()
+    private let logger = Logger(subsystem: "jp.yappo.Photokichin", category: "camera-io")
     private var records: [String: CameraRecord] = [:]
     private var didStart = false
 
@@ -82,13 +199,16 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
 
     private final class CameraRecord {
         let device: ICCameraDevice
+        let sessionRequestedAt: Date
         var descriptor: CameraDescriptor
         var filesByIdentifier: [String: ICCameraFile] = [:]
         var groups: [PhotoGroup] = []
         var catalogProgressTask: Task<Void, Never>?
+        var catalogRefreshTask: Task<Void, Never>?
 
         init(device: ICCameraDevice, descriptor: CameraDescriptor) {
             self.device = device
+            self.sessionRequestedAt = Date()
             self.descriptor = descriptor
         }
     }
@@ -123,6 +243,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         browser.stop()
         for record in records.values {
             record.catalogProgressTask?.cancel()
+            record.catalogRefreshTask?.cancel()
         }
         for record in records.values where record.device.hasOpenSession {
             record.device.requestCloseSession()
@@ -367,29 +488,34 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
 
     nonisolated func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
         Task { @MainActor [weak self] in
-            self?.catalogReady(device)
+            guard let self, let record = self.record(for: device) else { return }
+            CameraRequestGate.shared.logSessionReady(
+                elapsed: Date().timeIntervalSince(record.sessionRequestedAt),
+                mediaFileCount: device.mediaFiles?.count ?? 0,
+                catalogPercent: Int(device.contentCatalogPercentCompleted)
+            )
+            self.catalogReady(device)
         }
     }
 
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {
         Task { @MainActor [weak self] in
             guard let self, let record = self.record(for: camera) else { return }
-            if record.descriptor.connectionState == .ready {
-                self.catalogReady(camera)
-            } else {
-                self.catalogUpdated(camera)
-            }
+            // Initial enumeration is published atomically from
+            // deviceDidBecomeReady. Publishing each didAdd batch makes the
+            // first row stay in place while later batches are inserted ahead
+            // of it, which repeatedly moves the rest of the grid and causes
+            // duplicate thumbnail work.
+            guard record.descriptor.connectionState == .ready else { return }
+            self.scheduleCatalogRefresh(for: camera)
         }
     }
 
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didRemove items: [ICCameraItem]) {
         Task { @MainActor [weak self] in
             guard let self, let record = self.record(for: camera) else { return }
-            if record.descriptor.connectionState == .ready {
-                self.catalogReady(camera)
-            } else {
-                self.catalogUpdated(camera)
-            }
+            guard record.descriptor.connectionState == .ready else { return }
+            self.scheduleCatalogRefresh(for: camera)
         }
     }
 
@@ -399,7 +525,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         Task { @MainActor [weak self] in
             guard let self, let record = self.record(for: camera) else { return }
             if record.descriptor.connectionState == .ready {
-                self.catalogReady(camera)
+                self.scheduleCatalogRefresh(for: camera)
             }
         }
     }
@@ -412,11 +538,27 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didReceivePTPEvent eventData: Data) {}
     nonisolated func cameraDeviceDidRemoveAccessRestriction(_ device: ICDevice) {}
     nonisolated func cameraDeviceDidEnableAccessRestriction(_ device: ICDevice) {}
+    nonisolated func cameraDevice(_ cameraDevice: ICCameraDevice, shouldGetThumbnailOf item: ICCameraItem) -> Bool {
+        CameraRequestGate.shared.allowsThumbnail(item)
+    }
+    nonisolated func cameraDevice(_ cameraDevice: ICCameraDevice, shouldGetMetadataOf item: ICCameraItem) -> Bool {
+        CameraRequestGate.shared.allowsMetadata(item)
+    }
 
     private func add(_ device: ICDevice) {
         guard let camera = device as? ICCameraDevice else { return }
         let id = cameraIdentifier(camera)
-        guard records[id] == nil else { return }
+        if let existing = records[id] {
+            // ImageCaptureCore can repost one physical camera with the same
+            // UUID but a new ICCameraDevice instance while ptpcamerad
+            // reconnects. Keeping the old object here leaves its session in
+            // openingSession forever and drops the new object's ready event.
+            guard existing.device !== camera else { return }
+            existing.catalogProgressTask?.cancel()
+            existing.catalogRefreshTask?.cancel()
+            CameraThumbnailCoordinator.shared.removeCamera(id: id)
+            logger.notice("camera_io device_replaced same_uuid=1")
+        }
 
         let descriptor = CameraDescriptor(
             id: id,
@@ -451,25 +593,41 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
     }
 
     private func remove(_ device: ICDevice) {
-        let id: String?
+        let id: String
         if let camera = device as? ICCameraDevice {
             id = cameraIdentifier(camera)
+            // A delayed removal for the old object must not remove a newly
+            // registered object with the same camera UUID.
+            guard let current = records[id], current.device === camera else { return }
         } else {
-            id = records.first(where: { $0.value.device === device })?.key
+            guard let matchingID = records.first(where: { $0.value.device === device })?.key else { return }
+            id = matchingID
         }
-        guard let id, let record = records.removeValue(forKey: id) else { return }
+        guard let record = records.removeValue(forKey: id) else { return }
         record.catalogProgressTask?.cancel()
+        record.catalogRefreshTask?.cancel()
         CameraThumbnailCoordinator.shared.removeCamera(id: id)
         publishDescriptors()
         onCameraRemoved?(id)
     }
 
     private func catalogReady(_ camera: ICCameraDevice) {
+        let id = cameraIdentifier(camera)
+        records[id]?.catalogRefreshTask?.cancel()
+        records[id]?.catalogRefreshTask = nil
         updateCatalog(for: camera, isComplete: true)
     }
 
-    private func catalogUpdated(_ camera: ICCameraDevice) {
-        updateCatalog(for: camera, isComplete: false)
+    private func scheduleCatalogRefresh(for camera: ICCameraDevice) {
+        let id = cameraIdentifier(camera)
+        guard let record = records[id] else { return }
+        record.catalogRefreshTask?.cancel()
+        record.catalogRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled, let self, let record = self.records[id] else { return }
+            record.catalogRefreshTask = nil
+            self.catalogReady(record.device)
+        }
     }
 
     private func updateCatalog(for camera: ICCameraDevice, isComplete: Bool) {
@@ -570,10 +728,34 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             groupsByKey[groupKey] = group
         }
 
-        var groups = groupsByKey.values.sorted(by: PhotoGroup.presentationPrecedes)
-        for index in groups.indices {
-            groups[index].presentationOrder = index
+        // Assign fixed slots once. Existing camera groups keep their original
+        // slot; only groups that were not in the previous catalog are sorted
+        // among themselves and appended after the existing slots. Thumbnail
+        // and metadata callbacks never enter this path, so they cannot move
+        // already-rendered rows or trigger an O(n log n) resort.
+        let previousOrderByID = Dictionary(
+            uniqueKeysWithValues: previousGroups.values.map { ($0.id, $0.presentationOrder) }
+        )
+        var nextPresentationOrder = (previousOrderByID.values.max() ?? -1) + 1
+        var existingGroups = groupsByKey.values.filter { previousOrderByID[$0.id] != nil }
+        existingGroups.sort {
+            previousOrderByID[$0.id, default: Int.max]
+                < previousOrderByID[$1.id, default: Int.max]
         }
+        var newGroups = groupsByKey.values.filter { previousOrderByID[$0.id] == nil }
+        newGroups.sort {
+            let lhsDate = $0.captureDate ?? .distantFuture
+            let rhsDate = $1.captureDate ?? .distantFuture
+            if lhsDate != rhsDate { return lhsDate < rhsDate }
+            let basenameOrder = $0.basename.localizedStandardCompare($1.basename)
+            if basenameOrder != .orderedSame { return basenameOrder == .orderedAscending }
+            return $0.id < $1.id
+        }
+        for index in newGroups.indices {
+            newGroups[index].presentationOrder = nextPresentationOrder
+            nextPresentationOrder += 1
+        }
+        let groups = existingGroups + newGroups
         if isComplete {
             record.catalogProgressTask?.cancel()
             record.catalogProgressTask = nil
@@ -606,8 +788,11 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
               let asset = reference.asset(for: .jpeg) ?? reference.assets.first,
               let file = record.filesByIdentifier[asset.identifier] else { return nil }
 
+        let gate = CameraRequestGate.shared
+        gate.beginMetadata(file)
         return await withCheckedContinuation { continuation in
             file.requestMetadataDictionary(options: nil) { dictionary, _ in
+                gate.endMetadata(file)
                 continuation.resume(returning: dictionary.flatMap { ImageIOReader.readMetadata(properties: $0) })
             }
         }
@@ -924,7 +1109,11 @@ final class CameraThumbnailCoordinator {
             active[request.key] = request
             let key = request.key
             let requestID = request.id
-            request.file.requestThumbnailData(options: [.imageSourceThumbnailMaxPixelSize: key.maxPixel]) { [weak self] data, _ in
+            let file = request.file
+            let gate = CameraRequestGate.shared
+            gate.beginThumbnail(file)
+            file.requestThumbnailData(options: [.imageSourceThumbnailMaxPixelSize: key.maxPixel]) { [weak self] data, _ in
+                gate.endThumbnail(file)
                 Task { @MainActor [weak self] in
                     self?.finish(requestID: requestID, key: key, data: data)
                 }

@@ -479,6 +479,13 @@ final class AppModel: ObservableObject {
         }
         focusedIDs = [first.id]
         lastFocusedID = first.id
+        requestMetadataForCurrentCameraFocus()
+    }
+
+    private func requestMetadataForCurrentCameraFocus() {
+        guard isCameraSource,
+              let focusedGroup = navigationFocusedGroup else { return }
+        prioritizeMetadata(for: focusedGroup.id, priority: .viewerCurrent)
     }
 
     var selectedCountText: String {
@@ -727,6 +734,7 @@ final class AppModel: ObservableObject {
             focusScrollEdge = .end
         }
         focusScrollRevision &+= 1
+        requestMetadataForCurrentCameraFocus()
     }
 
     func moveFocusPage(direction: FocusDirection) {
@@ -759,6 +767,7 @@ final class AppModel: ObservableObject {
         userMovedFocusForCurrentSource = true
         focusScrollEdge = direction == .down ? .end : .beginning
         focusScrollRevision &+= 1
+        requestMetadataForCurrentCameraFocus()
     }
 
     private var navigationFocusedGroup: PhotoGroup? {
@@ -791,6 +800,7 @@ final class AppModel: ObservableObject {
         // observing only focusedIDs would correctly emit no event while the
         // visible scroll position could still be elsewhere.
         focusScrollRevision &+= 1
+        requestMetadataForCurrentCameraFocus()
     }
 
     func scan(url: URL, volume: MountedVolume? = nil) {
@@ -2302,12 +2312,14 @@ final class AppModel: ObservableObject {
             focusedIDs = [group.id]
         }
         lastFocusedID = group.id
+        requestMetadataForCurrentCameraFocus()
     }
 
     func setFocus(ids: Set<String>) {
         userMovedFocusForCurrentSource = true
         focusedIDs = ids
         lastFocusedID = groups.first(where: { ids.contains($0.id) })?.id
+        requestMetadataForCurrentCameraFocus()
     }
 
     func toggleFocusedSelection() {
@@ -2839,7 +2851,11 @@ final class AppModel: ObservableObject {
     func prioritizeMetadata(for groupID: String, priority: MetadataRequestPriority) {
         guard let group = groupByID[groupID], !group.isMetadataLoaded else { return }
         if group.isCameraBacked {
-            guard priority != .prefetch else { return }
+            // A camera's metadata is not a background catalogue job. Only
+            // the photo currently under keyboard/click focus or open in the
+            // viewer may issue an explicit request. This keeps the delegate
+            // gate closed for every other camera item.
+            guard lastFocusedID == groupID || viewerGroupID == groupID else { return }
             let token = currentScanToken
             Task { @MainActor [weak self] in
                 await Task.yield()
