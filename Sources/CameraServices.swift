@@ -184,11 +184,13 @@ struct CameraDescriptor: Identifiable, Hashable, Sendable {
 @MainActor
 final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, ICDeviceDelegate, ICCameraDeviceDelegate {
     static let shared = CameraMonitor()
+    private static let catalogRefreshInterval: TimeInterval = 5
 
     @Published private(set) var cameras: [CameraDescriptor] = []
     private let browser = ICDeviceBrowser()
     private let logger = Logger(subsystem: "jp.yappo.Photokichin", category: "camera-io")
     private var records: [String: CameraRecord] = [:]
+    private var catalogTraces: [String: CatalogTrace] = [:]
     private var didStart = false
 
     var onCameraReady: ((CameraDescriptor, [PhotoGroup]) -> Void)?
@@ -204,13 +206,28 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         var filesByIdentifier: [String: ICCameraFile] = [:]
         var groups: [PhotoGroup] = []
         var catalogProgressTask: Task<Void, Never>?
-        var catalogRefreshTask: Task<Void, Never>?
+        var catalogRefreshNextAllowedAt: Date?
+        var catalogRefreshInFlight = false
+        var catalogUpdateStartedAt: Date?
+        var catalogUpdateFinishedAt: Date?
+        var catalogCompletionEventAt: Date?
+        var catalogRefreshAcceptedCount = 0
+        var catalogRefreshIgnoredCount = 0
 
         init(device: ICCameraDevice, descriptor: CameraDescriptor) {
             self.device = device
             self.sessionRequestedAt = Date()
             self.descriptor = descriptor
         }
+    }
+
+    private struct CatalogTrace {
+        var totalCallbacks = 0
+        var totalItems = 0
+        var windowCallbacks = 0
+        var windowItems = 0
+        var windowStartedAt: Date?
+        var lastReportedAt: Date?
     }
 
     override init() {
@@ -243,12 +260,12 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         browser.stop()
         for record in records.values {
             record.catalogProgressTask?.cancel()
-            record.catalogRefreshTask?.cancel()
         }
         for record in records.values where record.device.hasOpenSession {
             record.device.requestCloseSession()
         }
         records.removeAll()
+        catalogTraces.removeAll()
         cameras.removeAll()
         onCamerasChanged?(cameras)
     }
@@ -487,46 +504,57 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
     // MARK: ICCameraDeviceDelegate
 
     nonisolated func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
+        let receivedAt = Date()
         Task { @MainActor [weak self] in
             guard let self, let record = self.record(for: device) else { return }
+            self.flushCatalogInput(for: device)
             CameraRequestGate.shared.logSessionReady(
                 elapsed: Date().timeIntervalSince(record.sessionRequestedAt),
                 mediaFileCount: device.mediaFiles?.count ?? 0,
                 catalogPercent: Int(device.contentCatalogPercentCompleted)
             )
-            self.catalogReady(device)
+            self.catalogReady(device, eventReceivedAt: receivedAt)
         }
     }
 
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {
+        let receivedAt = Date()
         Task { @MainActor [weak self] in
-            guard let self, let record = self.record(for: camera) else { return }
-            // Initial enumeration is published atomically from
-            // deviceDidBecomeReady. Publishing each didAdd batch makes the
-            // first row stay in place while later batches are inserted ahead
-            // of it, which repeatedly moves the rest of the grid and causes
-            // duplicate thumbnail work.
-            guard record.descriptor.connectionState == .ready else { return }
-            self.scheduleCatalogRefresh(for: camera)
+            guard let self, self.record(for: camera) != nil else { return }
+            self.traceCatalogInput(for: camera, itemCount: items.count, receivedAt: receivedAt)
+            self.handleCatalogRefreshTrigger(
+                for: camera,
+                receivedAt: receivedAt,
+                kind: "did_add"
+            )
         }
     }
 
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didRemove items: [ICCameraItem]) {
+        let receivedAt = Date()
         Task { @MainActor [weak self] in
-            guard let self, let record = self.record(for: camera) else { return }
-            guard record.descriptor.connectionState == .ready else { return }
-            self.scheduleCatalogRefresh(for: camera)
+            guard let self, let record = self.record(for: camera),
+                  record.descriptor.connectionState == .ready else { return }
+            self.handleCatalogRefreshTrigger(
+                for: camera,
+                receivedAt: receivedAt,
+                kind: "did_remove"
+            )
         }
     }
 
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didReceiveThumbnail thumbnail: CGImage?, for item: ICCameraItem, error: Error?) {}
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didReceiveMetadata metadata: [AnyHashable: Any]?, for item: ICCameraItem, error: Error?) {}
     nonisolated func cameraDevice(_ camera: ICCameraDevice, didRenameItems items: [ICCameraItem]) {
+        let receivedAt = Date()
         Task { @MainActor [weak self] in
-            guard let self, let record = self.record(for: camera) else { return }
-            if record.descriptor.connectionState == .ready {
-                self.scheduleCatalogRefresh(for: camera)
-            }
+            guard let self, let record = self.record(for: camera),
+                  record.descriptor.connectionState == .ready else { return }
+            self.handleCatalogRefreshTrigger(
+                for: camera,
+                receivedAt: receivedAt,
+                kind: "did_rename"
+            )
         }
     }
     nonisolated func cameraDeviceDidChangeCapability(_ camera: ICCameraDevice) {
@@ -555,7 +583,6 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             // openingSession forever and drops the new object's ready event.
             guard existing.device !== camera else { return }
             existing.catalogProgressTask?.cancel()
-            existing.catalogRefreshTask?.cancel()
             CameraThumbnailCoordinator.shared.removeCamera(id: id)
             logger.notice("camera_io device_replaced same_uuid=1")
         }
@@ -572,6 +599,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         )
         let record = CameraRecord(device: camera, descriptor: descriptor)
         records[id] = record
+        catalogTraces[id] = CatalogTrace()
         camera.delegate = self
         publishDescriptors()
         startCatalogProgress(for: id)
@@ -604,35 +632,121 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             id = matchingID
         }
         guard let record = records.removeValue(forKey: id) else { return }
+        catalogTraces.removeValue(forKey: id)
         record.catalogProgressTask?.cancel()
-        record.catalogRefreshTask?.cancel()
         CameraThumbnailCoordinator.shared.removeCamera(id: id)
         publishDescriptors()
         onCameraRemoved?(id)
     }
 
-    private func catalogReady(_ camera: ICCameraDevice) {
-        let id = cameraIdentifier(camera)
-        records[id]?.catalogRefreshTask?.cancel()
-        records[id]?.catalogRefreshTask = nil
-        updateCatalog(for: camera, isComplete: true)
-    }
-
-    private func scheduleCatalogRefresh(for camera: ICCameraDevice) {
+    private func catalogReady(_ camera: ICCameraDevice, eventReceivedAt: Date) {
         let id = cameraIdentifier(camera)
         guard let record = records[id] else { return }
-        record.catalogRefreshTask?.cancel()
-        record.catalogRefreshTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            guard !Task.isCancelled, let self, let record = self.records[id] else { return }
-            record.catalogRefreshTask = nil
-            self.catalogReady(record.device)
+        guard record.descriptor.connectionState != .ready else { return }
+        record.catalogCompletionEventAt = eventReceivedAt
+        record.catalogRefreshNextAllowedAt = Date().addingTimeInterval(Self.catalogRefreshInterval)
+        record.catalogRefreshInFlight = true
+        logger.notice(
+            "camera_io catalog_refresh kind=complete action=accepted final=1 accepted=\(record.catalogRefreshAcceptedCount, privacy: .public) ignored=\(record.catalogRefreshIgnoredCount, privacy: .public) interval_seconds=\(Self.catalogRefreshInterval, privacy: .public)"
+        )
+        updateCatalog(for: camera, isComplete: true)
+        record.catalogRefreshInFlight = false
+    }
+
+    private func handleCatalogRefreshTrigger(
+        for camera: ICCameraDevice,
+        receivedAt: Date,
+        kind: String
+    ) {
+        // This is a leading-edge event gate: accept one trigger, then ignore
+        // triggers for five seconds. There is deliberately no timer that
+        // performs a refresh by itself. A trigger received while the current
+        // catalog/list replacement is running is also discarded, even when
+        // the five-second interval has already elapsed.
+        let id = cameraIdentifier(camera)
+        guard let record = records[id] else { return }
+
+        switch record.descriptor.connectionState {
+        case .openingSession, .cataloging, .ready:
+            break
+        default:
+            return
         }
+
+        if let completionEventAt = record.catalogCompletionEventAt,
+           receivedAt <= completionEventAt {
+            logIgnoredCatalogRefresh(
+                record: record,
+                kind: kind,
+                reason: "before_completion_event"
+            )
+            return
+        }
+
+        if record.catalogRefreshInFlight,
+           let startedAt = record.catalogUpdateStartedAt,
+           receivedAt >= startedAt {
+            logIgnoredCatalogRefresh(
+                record: record,
+                kind: kind,
+                reason: "catalog_update_in_flight"
+            )
+            return
+        }
+
+        if let startedAt = record.catalogUpdateStartedAt,
+           let finishedAt = record.catalogUpdateFinishedAt,
+           receivedAt >= startedAt,
+           receivedAt <= finishedAt {
+            logIgnoredCatalogRefresh(
+                record: record,
+                kind: kind,
+                reason: "catalog_update_in_flight"
+            )
+            return
+        }
+
+        if let nextAllowedAt = record.catalogRefreshNextAllowedAt,
+           receivedAt < nextAllowedAt {
+            logIgnoredCatalogRefresh(
+                record: record,
+                kind: kind,
+                reason: "five_second_interval"
+            )
+            return
+        }
+
+        record.catalogRefreshAcceptedCount += 1
+        let acceptedAt = Date()
+        record.catalogRefreshNextAllowedAt = acceptedAt.addingTimeInterval(Self.catalogRefreshInterval)
+        record.catalogRefreshInFlight = true
+        logger.notice(
+            "camera_io catalog_refresh kind=\(kind, privacy: .public) action=accepted accepted=\(record.catalogRefreshAcceptedCount, privacy: .public) ignored=\(record.catalogRefreshIgnoredCount, privacy: .public) interval_seconds=\(Self.catalogRefreshInterval, privacy: .public)"
+        )
+        updateCatalog(for: camera, isComplete: false)
+        record.catalogRefreshInFlight = false
+    }
+
+    private func logIgnoredCatalogRefresh(
+        record: CameraRecord,
+        kind: String,
+        reason: String
+    ) {
+        record.catalogRefreshIgnoredCount += 1
+        let ignoredCount = record.catalogRefreshIgnoredCount
+        guard ignoredCount <= 3 || ignoredCount.isMultiple(of: 1000) else { return }
+        logger.notice(
+            "camera_io catalog_refresh kind=\(kind, privacy: .public) action=ignored reason=\(reason, privacy: .public) accepted=\(record.catalogRefreshAcceptedCount, privacy: .public) ignored=\(ignoredCount, privacy: .public)"
+        )
     }
 
     private func updateCatalog(for camera: ICCameraDevice, isComplete: Bool) {
         let id = cameraIdentifier(camera)
         guard let record = records[id] else { return }
+        let startedAt = Date()
+        record.catalogUpdateStartedAt = startedAt
+        record.catalogUpdateFinishedAt = nil
+        logger.notice("camera_io catalog_update_begin complete=\(isComplete ? 1 : 0, privacy: .public) media_files=\(camera.mediaFiles?.count ?? 0, privacy: .public) previous_groups=\(record.groups.count, privacy: .public)")
 
         var files = (camera.mediaFiles ?? []).compactMap { $0 as? ICCameraFile }
         // ImageCaptureCore exposes the JPG/CR3 relationship through
@@ -728,22 +842,10 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             groupsByKey[groupKey] = group
         }
 
-        // Assign fixed slots once. Existing camera groups keep their original
-        // slot; only groups that were not in the previous catalog are sorted
-        // among themselves and appended after the existing slots. Thumbnail
-        // and metadata callbacks never enter this path, so they cannot move
-        // already-rendered rows or trigger an O(n log n) resort.
-        let previousOrderByID = Dictionary(
-            uniqueKeysWithValues: previousGroups.values.map { ($0.id, $0.presentationOrder) }
-        )
-        var nextPresentationOrder = (previousOrderByID.values.max() ?? -1) + 1
-        var existingGroups = groupsByKey.values.filter { previousOrderByID[$0.id] != nil }
-        existingGroups.sort {
-            previousOrderByID[$0.id, default: Int.max]
-                < previousOrderByID[$1.id, default: Int.max]
-        }
-        var newGroups = groupsByKey.values.filter { previousOrderByID[$0.id] == nil }
-        newGroups.sort {
+        // Each accepted trigger publishes a complete replacement snapshot.
+        // Recompute the order from the current catalog instead of preserving
+        // old slots or appending new groups after them.
+        var groups = groupsByKey.values.sorted {
             let lhsDate = $0.captureDate ?? .distantFuture
             let rhsDate = $1.captureDate ?? .distantFuture
             if lhsDate != rhsDate { return lhsDate < rhsDate }
@@ -751,11 +853,9 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             if basenameOrder != .orderedSame { return basenameOrder == .orderedAscending }
             return $0.id < $1.id
         }
-        for index in newGroups.indices {
-            newGroups[index].presentationOrder = nextPresentationOrder
-            nextPresentationOrder += 1
+        for index in groups.indices {
+            groups[index].presentationOrder = index
         }
-        let groups = existingGroups + newGroups
         if isComplete {
             record.catalogProgressTask?.cancel()
             record.catalogProgressTask = nil
@@ -780,6 +880,45 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         } else {
             onCameraCatalogUpdate?(record.descriptor, groups)
         }
+        let finishedAt = Date()
+        record.catalogUpdateFinishedAt = finishedAt
+        logger.notice("camera_io catalog_update_end complete=\(isComplete ? 1 : 0, privacy: .public) groups=\(groups.count, privacy: .public) elapsed_ms=\(finishedAt.timeIntervalSince(startedAt) * 1000, privacy: .public)")
+    }
+
+    private func traceCatalogInput(for camera: ICCameraDevice, itemCount: Int, receivedAt: Date) {
+        let id = cameraIdentifier(camera)
+        var trace = catalogTraces[id, default: CatalogTrace()]
+        let now = receivedAt
+        if trace.windowStartedAt == nil { trace.windowStartedAt = receivedAt }
+        trace.totalCallbacks += 1
+        trace.totalItems += itemCount
+        trace.windowCallbacks += 1
+        trace.windowItems += itemCount
+
+        let shouldReport = trace.lastReportedAt == nil
+            || now.timeIntervalSince(trace.lastReportedAt!) >= 1
+        if shouldReport {
+            let windowSeconds = now.timeIntervalSince(trace.windowStartedAt ?? now)
+            logger.notice("camera_io catalog_input window_callbacks=\(trace.windowCallbacks, privacy: .public) window_items=\(trace.windowItems, privacy: .public) total_callbacks=\(trace.totalCallbacks, privacy: .public) total_items=\(trace.totalItems, privacy: .public) window_seconds=\(windowSeconds, privacy: .public) percent=\(Int(camera.contentCatalogPercentCompleted), privacy: .public)")
+            trace.windowCallbacks = 0
+            trace.windowItems = 0
+            trace.windowStartedAt = now
+            trace.lastReportedAt = now
+        }
+        catalogTraces[id] = trace
+    }
+
+    private func flushCatalogInput(for camera: ICCameraDevice) {
+        let id = cameraIdentifier(camera)
+        guard var trace = catalogTraces[id], trace.windowCallbacks > 0 else { return }
+        let now = Date()
+        let windowSeconds = now.timeIntervalSince(trace.windowStartedAt ?? now)
+        logger.notice("camera_io catalog_input_final window_callbacks=\(trace.windowCallbacks, privacy: .public) window_items=\(trace.windowItems, privacy: .public) total_callbacks=\(trace.totalCallbacks, privacy: .public) total_items=\(trace.totalItems, privacy: .public) window_seconds=\(windowSeconds, privacy: .public) percent=\(Int(camera.contentCatalogPercentCompleted), privacy: .public)")
+        trace.windowCallbacks = 0
+        trace.windowItems = 0
+        trace.windowStartedAt = now
+        trace.lastReportedAt = now
+        catalogTraces[id] = trace
     }
 
     func requestMetadata(for group: PhotoGroup) async -> PhotoMetadata? {

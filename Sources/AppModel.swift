@@ -1057,8 +1057,17 @@ final class AppModel: ObservableObject {
         scanTask = nil
         self.groups = groups
         rebuildGroupedPhotos()
-        if !userMovedFocusForCurrentSource {
-            let availableIDs = Set(groups.map(\.id))
+        let availableIDs = Set(groups.map(\.id))
+        let retainedFocusedIDs = focusedIDs.intersection(availableIDs)
+        if groups.isEmpty {
+            focusedIDs.removeAll()
+            lastFocusedID = nil
+        } else if !retainedFocusedIDs.isEmpty {
+            focusedIDs = retainedFocusedIDs
+            if let lastFocusedID, retainedFocusedIDs.contains(lastFocusedID) == false {
+                self.lastFocusedID = retainedFocusedIDs.first
+            }
+        } else if !userMovedFocusForCurrentSource {
             let restoredIDs = pendingRestoredFocusIDs.intersection(availableIDs)
             if !restoredIDs.isEmpty {
                 focusedIDs = restoredIDs
@@ -1069,10 +1078,12 @@ final class AppModel: ObservableObject {
             } else if !groups.isEmpty {
                 focusFirstVisiblePhoto()
             }
+        } else if !groups.isEmpty {
+            focusFirstVisiblePhoto()
         }
         pendingRestoredFocusIDs.removeAll(keepingCapacity: true)
         pendingRestoredLastFocusID = nil
-        isScanning = false
+        isScanning = !isComplete
         progressText = isComplete
             ? String(groups.count) + "組を表示中"
             : String(groups.count) + "組を表示中・追加読み込み中"

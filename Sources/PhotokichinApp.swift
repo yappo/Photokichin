@@ -561,14 +561,17 @@ private struct PhotoGrid: View {
             filteredGroups: [:]
         )
 
-        // A returning source keeps its complete list throughout the rescan.
-        // Publishing the scanner's small initial snapshot into an existing
-        // ScrollView would briefly shrink its content and irreversibly clamp
-        // the retained scroll offset. A source without a retained view still
-        // receives the initial snapshot for fast first display.
+        // A returning volume source keeps its complete list throughout a
+        // rescan so a small initial filesystem batch cannot clamp its saved
+        // scroll offset. Camera catalog snapshots are different: each
+        // accepted catalog is the requested replacement and must be published
+        // while the camera is still cataloging.
         let hasRetainedContent = existingSnapshot?.allGroups.isEmpty == false
-        let mayPublishCurrentGroups = !hasRetainedContent || !model.isScanning
-        if mayPublishCurrentGroups, !model.groups.isEmpty {
+        let isLiveCameraCatalogUpdate = model.isCameraSource && model.isCameraCataloging
+        let mayPublishCurrentGroups = isLiveCameraCatalogUpdate
+            || !hasRetainedContent
+            || !model.isScanning
+        if mayPublishCurrentGroups {
             snapshot.allGroups = model.groupedPhotos
             if model.hasActiveFilters {
                 snapshot.filteredGroups[filterKey] = model.filteredGroupedPhotos
