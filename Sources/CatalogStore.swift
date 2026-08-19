@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os
 import SQLite3
 
 struct CatalogImportRecord: Sendable {
@@ -113,6 +114,7 @@ final class CatalogStore: @unchecked Sendable {
     let catalogURL: URL
     let catalogDirectoryURL: URL
     private let libraryRoot: URL
+    private let logger = Logger(subsystem: "jp.yappo.Photokichin", category: "catalog-match")
     private var database: OpaquePointer?
     private let lock = NSLock()
 
@@ -158,7 +160,10 @@ final class CatalogStore: @unchecked Sendable {
         } else {
             sql = "SELECT destination_path, sha256, file_state FROM imported_files WHERE variant = ? AND source_key IN (?, ?) LIMIT 1;"
         }
-        guard let statement = prepare(sql) else { return false }
+        guard let statement = prepare(sql) else {
+            logger.error("catalog_import_state query_prepare_failed source_key=\(sourceKey, privacy: .public) variant=\(variant.rawValue, privacy: .public)")
+            return false
+        }
         defer { sqlite3_finalize(statement) }
         if legacySourceKey == nil || legacySourceKey == sourceKey {
             bind(sourceKey, to: statement, at: 1)
@@ -168,13 +173,16 @@ final class CatalogStore: @unchecked Sendable {
             bind(sourceKey, to: statement, at: 2)
             bind(legacySourceKey!, to: statement, at: 3)
         }
-        guard sqlite3_step(statement) == SQLITE_ROW,
-              let path = text(statement, column: 0),
-              let sha = text(statement, column: 1),
-              let state = text(statement, column: 2),
-              !sha.isEmpty,
-              ["present", "moved"].contains(state) else { return false }
-        return FileManager.default.fileExists(atPath: path)
+        let rowFound = sqlite3_step(statement) == SQLITE_ROW
+        let path = rowFound ? text(statement, column: 0) : nil
+        let sha = rowFound ? text(statement, column: 1) : nil
+        let state = rowFound ? text(statement, column: 2) : nil
+        let imported = path != nil
+            && sha.map { !$0.isEmpty } == true
+            && state.map { ["present", "moved"].contains($0) } == true
+            && FileManager.default.fileExists(atPath: path!)
+        logger.debug("catalog_import_state source_key=\(sourceKey, privacy: .public) legacy_source_key=\(legacySourceKey ?? "", privacy: .public) variant=\(variant.rawValue, privacy: .public) row_found=\(rowFound ? 1 : 0, privacy: .public) file_state=\(state ?? "", privacy: .public) destination_exists=\(path.map { FileManager.default.fileExists(atPath: $0) } == true ? 1 : 0, privacy: .public) imported=\(imported ? 1 : 0, privacy: .public)")
+        return imported
     }
 
     func importedDestination(sourceKey: String, variant: AssetVariant, legacySourceKey: String? = nil) -> URL? {
@@ -230,17 +238,26 @@ final class CatalogStore: @unchecked Sendable {
     /// Returns metadata-only candidates for a camera item. This never reads
     /// the photo bytes and does not establish identity; the downloaded camera
     /// file must still be verified by SHA-256.
-    func matchCandidates(fileSize: Int64, variant: AssetVariant) -> [CatalogMatchCandidate] {
+    func matchCandidates(sourceFilenameKey: String?, fileSize: Int64, variant: AssetVariant) -> [CatalogMatchCandidate] {
         lock.lock(); defer { lock.unlock() }
+        guard let sourceFilenameKey, !sourceFilenameKey.isEmpty else {
+            logger.debug("catalog_match_candidates source_filename_key=\"\" file_size=\(fileSize, privacy: .public) variant=\(variant.rawValue, privacy: .public) result_count=0 reason=missing_filename_key")
+            return []
+        }
         var result: [CatalogMatchCandidate] = []
         let queries = [
-            ("SELECT destination_path, sha256, file_size, source_filename_key FROM imported_files WHERE file_size = ? AND variant = ?;", false),
-            ("SELECT path, sha256, file_size, filename_key FROM library_assets WHERE file_size = ? AND variant = ?;", true)
+            ("imported_files", "SELECT destination_path, sha256, file_size, source_filename_key FROM imported_files WHERE file_size = ? AND source_filename_key = ? AND variant = ?;"),
+            ("library_assets", "SELECT path, sha256, file_size, filename_key FROM library_assets WHERE file_size = ? AND filename_key = ? AND variant = ?;")
         ]
-        for (query, _) in queries {
-            guard let statement = prepare(query) else { continue }
+        for (table, query) in queries {
+            logger.debug("catalog_match_candidates query table=\(table, privacy: .public) source_filename_key=\(sourceFilenameKey, privacy: .public) file_size=\(fileSize, privacy: .public) variant=\(variant.rawValue, privacy: .public)")
+            guard let statement = prepare(query) else {
+                logger.error("catalog_match_candidates query_prepare_failed table=\(table, privacy: .public)")
+                continue
+            }
             sqlite3_bind_int64(statement, 1, fileSize)
-            bind(variant.rawValue, to: statement, at: 2)
+            bind(sourceFilenameKey, to: statement, at: 2)
+            bind(variant.rawValue, to: statement, at: 3)
             while sqlite3_step(statement) == SQLITE_ROW,
                   let path = text(statement, column: 0),
                   let sha256 = text(statement, column: 1) {
@@ -254,6 +271,10 @@ final class CatalogStore: @unchecked Sendable {
             }
             sqlite3_finalize(statement)
         }
+        let details = result.map {
+            "\($0.path.standardizedFileURL.path)|size=\($0.fileSize)|key=\($0.filenameKey ?? "")|sha256=\($0.sha256)"
+        }.joined(separator: ";")
+        logger.debug("catalog_match_candidates result source_filename_key=\(sourceFilenameKey, privacy: .public) file_size=\(fileSize, privacy: .public) variant=\(variant.rawValue, privacy: .public) result_count=\(result.count, privacy: .public) candidates=\(details, privacy: .public)")
         return result
     }
 

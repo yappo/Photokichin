@@ -76,6 +76,18 @@ struct PhotokichinTestRunner {
         let pending = makeGroup(root: root, jpeg: true, raw: true, importedJPEG: false, importedRAW: false)
         try require(pending.cardImportState == .notImported, "an unimported JPG＋CR3 pair must be未取り込み")
 
+        var possible = makeGroup(root: root, jpeg: true, raw: true, importedJPEG: false, importedRAW: false)
+        possible.possibleImportedJPEG = true
+        try require(possible.displayImportState == .possible, "a metadata-only camera match must be取り込み済みかもしれない")
+        try require(
+            possible.matches(importFilter: .possible, operationFilter: .all, selected: false, deleteCandidate: false),
+            "the possible import filter must include metadata-only matches"
+        )
+        try require(
+            !possible.matches(importFilter: .notImported, operationFilter: .all, selected: false, deleteCandidate: false),
+            "a possible import must not be shown as未取り込み"
+        )
+
         let rawOnlyImported = makeGroup(root: root, jpeg: true, raw: true, importedJPEG: false, importedRAW: true)
         try require(rawOnlyImported.cardImportState == .partial, "CR3 imported and JPG unimported must be一部")
 
@@ -283,7 +295,9 @@ struct PhotokichinTestRunner {
         jpeg: Bool,
         raw: Bool,
         importedJPEG: Bool,
-        importedRAW: Bool
+        importedRAW: Bool,
+        possibleImportedJPEG: Bool = false,
+        possibleImportedRAW: Bool = false
     ) -> PhotoGroup {
         PhotoGroup(
             id: UUID().uuidString,
@@ -296,7 +310,9 @@ struct PhotokichinTestRunner {
             metadata: .empty,
             importedJPEG: importedJPEG,
             importedRAW: importedRAW,
-            isMetadataLoaded: true
+            isMetadataLoaded: true,
+            possibleImportedJPEG: possibleImportedJPEG,
+            possibleImportedRAW: possibleImportedRAW
         )
     }
 
@@ -373,9 +389,13 @@ struct PhotokichinTestRunner {
             fileSize: Int64(contents.count)
         )
 
-        let candidates = store.matchCandidates(fileSize: Int64(contents.count), variant: .jpeg)
+        let candidates = store.matchCandidates(sourceFilenameKey: "img_0001.jpg", fileSize: Int64(contents.count), variant: .jpeg)
         try require(candidates.count == 2, "metadata-only candidate lookup should include imported and library records")
         try require(candidates.allSatisfy { $0.filenameKey == "img_0001.jpg" }, "candidate lookup should retain normalized filename keys")
+        try require(
+            store.matchCandidates(sourceFilenameKey: "other.jpg", fileSize: Int64(contents.count), variant: .jpeg).isEmpty,
+            "candidate lookup must use the normalized filename key as well as size and variant"
+        )
         try require(
             store.existingContentDestination(sha256: digest, variant: .jpeg, fileSize: Int64(contents.count)) != nil,
             "a verified camera hash should find an existing library destination"

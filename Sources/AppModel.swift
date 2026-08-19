@@ -331,6 +331,12 @@ final class AppModel: ObservableObject {
         labels.filter { activeLabelIDs.contains($0.id) }
     }
 
+    var availableImportFilters: [PhotoImportFilter] {
+        PhotoImportFilter.allCases.filter { filter in
+            filter != .possible || isCameraSource
+        }
+    }
+
     /// Custom command-menu shortcuts must be disabled while a label sheet is
     /// active so standard text editing commands such as Command-A remain with
     /// the sheet's first responder instead of operating the photo list.
@@ -1057,6 +1063,18 @@ final class AppModel: ObservableObject {
         scanTask = nil
         self.groups = groups
         rebuildGroupedPhotos()
+        if let importCatalog = targetCatalog {
+            scheduleImportStateEnrichment(
+                groups: groups,
+                isLibraryView: false,
+                catalog: importCatalog,
+                targetCatalog: importCatalog,
+                sourceRoot: sourceURL,
+                targetRoot: libraryURL,
+                volumeUUID: nil,
+                token: currentScanToken
+            )
+        }
         let availableIDs = Set(groups.map(\.id))
         let retainedFocusedIDs = focusedIDs.intersection(availableIDs)
         if groups.isEmpty {
@@ -2614,6 +2632,8 @@ final class AppModel: ObservableObject {
                 var current = self.groupByID[enrichedGroup.id] ?? merged[index]
                 current.importedJPEG = enrichedGroup.importedJPEG
                 current.importedRAW = enrichedGroup.importedRAW
+                current.possibleImportedJPEG = enrichedGroup.possibleImportedJPEG
+                current.possibleImportedRAW = enrichedGroup.possibleImportedRAW
                 current.libraryAssetStatus = enrichedGroup.libraryAssetStatus
                 merged[index] = current
             }
@@ -2651,22 +2671,39 @@ final class AppModel: ObservableObject {
             updated.libraryAssetStatus = .notApplicable
             updated.importedJPEG = false
             updated.importedRAW = false
-            guard let catalog, let reference = group.cameraReference else { return updated }
-            if reference.asset(for: .jpeg) != nil {
+            updated.possibleImportedJPEG = false
+            updated.possibleImportedRAW = false
+            guard let catalog = targetCatalog,
+                  let reference = group.cameraReference else { return updated }
+            if let asset = reference.asset(for: .jpeg) {
                 let sourceKey = CameraMonitor.catalogSourceKey(
                     cameraID: reference.cameraID,
                     groupKey: reference.groupKey,
                     variant: .jpeg
                 )
                 updated.importedJPEG = catalog.isImported(sourceKey: sourceKey, variant: .jpeg)
+                if !updated.importedJPEG {
+                    updated.possibleImportedJPEG = !catalog.matchCandidates(
+                        sourceFilenameKey: FilenameIdentity.key(for: asset.filename),
+                        fileSize: asset.fileSize,
+                        variant: .jpeg
+                    ).isEmpty
+                }
             }
-            if reference.asset(for: .raw) != nil {
+            if let asset = reference.asset(for: .raw) {
                 let sourceKey = CameraMonitor.catalogSourceKey(
                     cameraID: reference.cameraID,
                     groupKey: reference.groupKey,
                     variant: .raw
                 )
                 updated.importedRAW = catalog.isImported(sourceKey: sourceKey, variant: .raw)
+                if !updated.importedRAW {
+                    updated.possibleImportedRAW = !catalog.matchCandidates(
+                        sourceFilenameKey: FilenameIdentity.key(for: asset.filename),
+                        fileSize: asset.fileSize,
+                        variant: .raw
+                    ).isEmpty
+                }
             }
             return updated
         }
@@ -2692,12 +2729,16 @@ final class AppModel: ObservableObject {
             let sourceManaged = [jpegSourceManaged, rawSourceManaged].filter { $0 }.count
             updated.importedJPEG = jpegTargetManaged
             updated.importedRAW = rawTargetManaged
+            updated.possibleImportedJPEG = false
+            updated.possibleImportedRAW = false
             updated.libraryAssetStatus = sourceManaged == 0 ? .unregistered : (sourceManaged == available ? .registered : .partial)
             return updated
         }
         updated.libraryAssetStatus = .notApplicable
         updated.importedJPEG = false
         updated.importedRAW = false
+        updated.possibleImportedJPEG = false
+        updated.possibleImportedRAW = false
         guard let catalog else { return updated }
         if let jpegURL = group.jpegURL {
             let sourceKey = SourceIdentity.key(url: jpegURL, variant: .jpeg, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
@@ -2741,7 +2782,7 @@ final class AppModel: ObservableObject {
         guard !isLibraryView else { return }
         guard let next = groups.first(where: { group in
             switch group.cardImportState {
-            case .notImported, .partial: return true
+            case .notImported, .possible, .partial: return true
             case .imported, .notApplicable: return false
             }
         }) else { return }

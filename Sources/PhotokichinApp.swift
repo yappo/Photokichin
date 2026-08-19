@@ -1193,7 +1193,7 @@ private struct PhotoImportClusterHeader: View {
             )
             Label(cluster.state.title, systemImage: cluster.state.systemImage)
                 .font(.callout.weight(.semibold))
-                .foregroundStyle(cluster.state == .partial ? .orange : .primary)
+                .foregroundStyle([.possible, .partial].contains(cluster.state) ? .orange : .primary)
             Text("\(cluster.photos.count)枚")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1282,7 +1282,7 @@ private struct SelectionSummaryBar: View {
                 .foregroundStyle(.secondary)
             if model.sourceURL != nil && !model.isLibraryView {
                 Menu {
-                    ForEach(PhotoImportFilter.allCases) { filter in
+                    ForEach(model.availableImportFilters) { filter in
                         Button {
                             model.importFilter = filter
                         } label: {
@@ -1414,7 +1414,7 @@ private struct DateSectionHeader: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(PhotoImportState.allCases.sorted { $0.sortOrder < $1.sortOrder }) { state in
-                            let count = photos.filter { $0.cardImportState == state }.count
+                            let count = photos.filter { $0.displayImportState == state }.count
                             if count > 0 {
                                 Text("\(state.title) \(count)")
                                     .font(.caption)
@@ -1484,6 +1484,7 @@ private struct DateSectionHeader: View {
     private func color(for state: PhotoImportState) -> Color {
         switch state {
         case .notImported: return .secondary
+        case .possible: return .orange
         case .partial: return .orange
         case .imported: return .green
         case .notApplicable: return .gray
@@ -1547,9 +1548,17 @@ private struct PhotoGroupTile: View {
                     .padding(7)
             }
             .overlay(alignment: .topTrailing) {
-                if showImportStatus && group.cardImportState == .imported {
-                    ImportedStatusBadge(size: 18)
-                        .padding(8)
+                if showImportStatus {
+                    switch group.displayImportState {
+                    case .imported:
+                        ImportedStatusBadge(size: 18)
+                            .padding(8)
+                    case .possible:
+                        PossibleImportedStatusBadge(size: 18)
+                            .padding(8)
+                    default:
+                        EmptyView()
+                    }
                 }
             }
             .overlay(alignment: .bottomTrailing) {
@@ -1663,6 +1672,28 @@ private struct ImportedStatusBadge: View {
     }
 }
 
+private struct PossibleImportedStatusBadge: View {
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.orange)
+            Image(systemName: "questionmark")
+                .font(.system(size: size * 0.55, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .frame(width: size, height: size)
+        .overlay {
+            Circle()
+                .stroke(Color.white.opacity(0.9), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.35), radius: 2)
+        .accessibilityLabel("取り込み済みかもしれない")
+        .help("取り込み済みかもしれない")
+    }
+}
+
 private struct PhotoVariantBadges: View {
     let group: PhotoGroup
 
@@ -1762,8 +1793,15 @@ private struct InspectorView: View {
                 if let group {
                     Text(group.basename).font(.subheadline.weight(.semibold)).textSelection(.enabled)
                     HStack(spacing: 7) {
-                        if !model.isLibraryView && group.cardImportState == .imported {
-                            ImportedStatusBadge(size: 18)
+                        if !model.isLibraryView {
+                            switch group.displayImportState {
+                            case .imported:
+                                ImportedStatusBadge(size: 18)
+                            case .possible:
+                                PossibleImportedStatusBadge(size: 18)
+                            default:
+                                EmptyView()
+                            }
                         }
                         PhotoVariantBadges(group: group)
                     }
@@ -2526,8 +2564,15 @@ private struct ViewerMetadataBar: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 9) {
-                if showImportStatus && group.cardImportState == .imported {
-                    ImportedStatusBadge(size: 18)
+                if showImportStatus {
+                    switch group.displayImportState {
+                    case .imported:
+                        ImportedStatusBadge(size: 18)
+                    case .possible:
+                        PossibleImportedStatusBadge(size: 18)
+                    default:
+                        EmptyView()
+                    }
                 }
                 PhotoVariantBadges(group: group)
                 Divider()
