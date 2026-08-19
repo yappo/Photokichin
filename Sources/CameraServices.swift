@@ -1,7 +1,150 @@
 import AppKit
 import Foundation
+import IOKit
+import IOKit.usb
 import os
 @preconcurrency import ImageCaptureCore
+
+/// A point-in-time summary of the files that ImageCaptureCore has exposed.
+/// File sizes are catalog metadata; no photo bytes are read here.
+private struct CameraCatalogSummary: Sendable {
+    var fileCount = 0
+    var totalBytes: Int64 = 0
+    var minimumBytes: Int64?
+    var maximumBytes: Int64 = 0
+    var jpegCount = 0
+    var rawCount = 0
+    var movieCount = 0
+    var otherCount = 0
+    var jpegBytes: Int64 = 0
+    var rawBytes: Int64 = 0
+    var movieBytes: Int64 = 0
+
+    mutating func add(_ file: ICCameraFile) {
+        let size = Int64(file.fileSize)
+        fileCount += 1
+        totalBytes += size
+        minimumBytes = minimumBytes.map { min($0, size) } ?? size
+        maximumBytes = max(maximumBytes, size)
+
+        switch URL(fileURLWithPath: file.originalFilename ?? file.name ?? "")
+            .pathExtension.lowercased() {
+        case "jpg", "jpeg":
+            jpegCount += 1
+            jpegBytes += size
+        case "cr3":
+            rawCount += 1
+            rawBytes += size
+        case "mov", "mp4":
+            movieCount += 1
+            movieBytes += size
+        default: otherCount += 1
+        }
+    }
+
+    static func fileBytes(in items: [ICCameraItem]) -> Int64 {
+        items.reduce(into: Int64(0)) { total, item in
+            if let file = item as? ICCameraFile {
+                total += Int64(file.fileSize)
+            }
+        }
+    }
+
+    var averageBytes: Double {
+        guard fileCount > 0 else { return 0 }
+        return Double(totalBytes) / Double(fileCount)
+    }
+
+    var minimumBytesForLog: Int64 { minimumBytes ?? 0 }
+}
+
+private struct CameraUSBInfo: Sendable {
+    let speed: String
+    let probeElapsed: TimeInterval
+
+    static func read(for camera: ICCameraDevice) -> CameraUSBInfo {
+        let startedAt = Date()
+        let speed = findSpeed(
+            vendorID: UInt64(max(0, camera.usbVendorID)),
+            productID: UInt64(max(0, camera.usbProductID)),
+            locationID: UInt64(max(0, camera.usbLocationID))
+        ) ?? "unknown"
+        return CameraUSBInfo(speed: speed, probeElapsed: Date().timeIntervalSince(startedAt))
+    }
+
+    private static func findSpeed(vendorID: UInt64, productID: UInt64, locationID: UInt64) -> String? {
+        let classNames = [kIOUSBHostDeviceClassName, kIOUSBDeviceClassName]
+        for className in classNames {
+            guard let matching = IOServiceMatching(className) else { continue }
+            var iterator: io_iterator_t = 0
+            guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+                continue
+            }
+            defer { IOObjectRelease(iterator) }
+
+            while case let service = IOIteratorNext(iterator), service != 0 {
+                defer { IOObjectRelease(service) }
+                guard let properties = properties(for: service),
+                      number(properties["idVendor"]) == vendorID,
+                      number(properties["idProduct"]) == productID,
+                      number(properties["locationID"]) == locationID else {
+                    continue
+                }
+
+                if let raw = number(properties["USBSpeed"]) {
+                    return speedName(raw, host: true)
+                }
+                if let raw = number(properties["Device Speed"]) {
+                    return speedName(raw, host: false)
+                }
+                if let raw = number(properties["UsbLinkSpeed"]) {
+                    return "\(raw)bps"
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func properties(for service: io_service_t) -> [String: Any]? {
+        var properties: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(
+            service,
+            &properties,
+            kCFAllocatorDefault,
+            0
+        ) == KERN_SUCCESS,
+        let properties else { return nil }
+        return properties.takeRetainedValue() as? [String: Any]
+    }
+
+    private static func number(_ value: Any?) -> UInt64? {
+        if let number = value as? NSNumber { return number.uint64Value }
+        return nil
+    }
+
+    private static func speedName(_ raw: UInt64, host: Bool) -> String {
+        if host {
+            switch raw {
+            case 1: return "full"
+            case 2: return "low"
+            case 3: return "high"
+            case 4: return "super"
+            case 5: return "super_plus"
+            case 6: return "super_plus_by2"
+            default: return "raw_\(raw)"
+            }
+        }
+        switch raw {
+        case 0: return "low"
+        case 1: return "full"
+        case 2: return "high"
+        case 3: return "super"
+        case 4: return "super_plus"
+        case 5: return "super_plus_by2"
+        default: return "raw_\(raw)"
+        }
+    }
+}
 
 /// Tracks whether ImageCaptureCore asked for work that Photokichin did not
 /// explicitly request. The counters are intentionally observable in the
@@ -76,8 +219,17 @@ private final class CameraRequestGate: @unchecked Sendable {
         return allowed
     }
 
-    func logSessionReady(elapsed: TimeInterval, mediaFileCount: Int, catalogPercent: Int) {
-        logger.notice("camera_io session_ready elapsed_seconds=\(elapsed, privacy: .public) media_files=\(mediaFileCount, privacy: .public) catalog_percent=\(catalogPercent, privacy: .public)")
+    func logSessionReady(
+        elapsed: TimeInterval,
+        mediaFileCount: Int,
+        catalogPercent: Int,
+        summary: CameraCatalogSummary,
+        usb: CameraUSBInfo,
+        summaryScanElapsed: TimeInterval
+    ) {
+        logger.notice(
+            "camera_io session_ready elapsed_seconds=\(elapsed, privacy: .public) files_per_second=\(elapsed > 0 ? Double(mediaFileCount) / elapsed : 0, privacy: .public) total_file_bytes=\(summary.totalBytes, privacy: .public) bytes_per_second=\(elapsed > 0 ? Double(summary.totalBytes) / elapsed : 0, privacy: .public) media_files=\(mediaFileCount, privacy: .public) catalog_percent=\(catalogPercent, privacy: .public) average_file_bytes=\(summary.averageBytes, privacy: .public) minimum_file_bytes=\(summary.minimumBytesForLog, privacy: .public) maximum_file_bytes=\(summary.maximumBytes, privacy: .public) jpeg_files=\(summary.jpegCount, privacy: .public) jpeg_bytes=\(summary.jpegBytes, privacy: .public) raw_files=\(summary.rawCount, privacy: .public) raw_bytes=\(summary.rawBytes, privacy: .public) movie_files=\(summary.movieCount, privacy: .public) movie_bytes=\(summary.movieBytes, privacy: .public) other_files=\(summary.otherCount, privacy: .public) summary_scan_elapsed_ms=\(summaryScanElapsed * 1000, privacy: .public) usb_speed=\(usb.speed, privacy: .public) usb_probe_elapsed_ms=\(usb.probeElapsed * 1000, privacy: .public)"
+        )
     }
 
     private func recordDecision(
@@ -205,6 +357,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         var descriptor: CameraDescriptor
         var filesByIdentifier: [String: ICCameraFile] = [:]
         var groups: [PhotoGroup] = []
+        var usbInfo: CameraUSBInfo
         var catalogProgressTask: Task<Void, Never>?
         var catalogRefreshNextAllowedAt: Date?
         var catalogRefreshInFlight = false
@@ -218,16 +371,21 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             self.device = device
             self.sessionRequestedAt = Date()
             self.descriptor = descriptor
+            self.usbInfo = CameraUSBInfo.read(for: device)
         }
     }
 
     private struct CatalogTrace {
         var totalCallbacks = 0
         var totalItems = 0
+        var totalFileBytes: Int64 = 0
         var windowCallbacks = 0
         var windowItems = 0
+        var windowFileBytes: Int64 = 0
         var windowStartedAt: Date?
         var lastReportedAt: Date?
+        var firstInputAt: Date?
+        var lastInputAt: Date?
     }
 
     override init() {
@@ -466,11 +624,17 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             guard let self else { return }
             if let error {
                 if let record = self.record(for: device) {
+                    self.logger.notice(
+                        "camera_io session_open_error elapsed_seconds=\(Date().timeIntervalSince(record.sessionRequestedAt), privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
                     self.updateState(for: record, state: .failed(error.localizedDescription))
                 }
                 self.onError?("カメラを開けませんでした: \(error.localizedDescription)")
             } else if let camera = device as? ICCameraDevice,
                       let record = self.record(for: device) {
+                self.logger.notice(
+                    "camera_io session_opened elapsed_seconds=\(Date().timeIntervalSince(record.sessionRequestedAt), privacy: .public) has_open_session=\(camera.hasOpenSession ? 1 : 0, privacy: .public) catalog_percent=\(Int(camera.contentCatalogPercentCompleted), privacy: .public)"
+                )
                 self.updateState(for: record, state: .cataloging(percent: Int(camera.contentCatalogPercentCompleted)))
             }
         }
@@ -508,10 +672,19 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         Task { @MainActor [weak self] in
             guard let self, let record = self.record(for: device) else { return }
             self.flushCatalogInput(for: device)
+            let summaryStartedAt = Date()
+            var summary = CameraCatalogSummary()
+            for file in (device.mediaFiles ?? []).compactMap({ $0 as? ICCameraFile }) {
+                summary.add(file)
+            }
+            let summaryScanElapsed = Date().timeIntervalSince(summaryStartedAt)
             CameraRequestGate.shared.logSessionReady(
-                elapsed: Date().timeIntervalSince(record.sessionRequestedAt),
+                elapsed: receivedAt.timeIntervalSince(record.sessionRequestedAt),
                 mediaFileCount: device.mediaFiles?.count ?? 0,
-                catalogPercent: Int(device.contentCatalogPercentCompleted)
+                catalogPercent: Int(device.contentCatalogPercentCompleted),
+                summary: summary,
+                usb: record.usbInfo,
+                summaryScanElapsed: summaryScanElapsed
             )
             self.catalogReady(device, eventReceivedAt: receivedAt)
         }
@@ -521,7 +694,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         let receivedAt = Date()
         Task { @MainActor [weak self] in
             guard let self, self.record(for: camera) != nil else { return }
-            self.traceCatalogInput(for: camera, itemCount: items.count, receivedAt: receivedAt)
+            self.traceCatalogInput(for: camera, items: items, receivedAt: receivedAt)
             self.handleCatalogRefreshTrigger(
                 for: camera,
                 receivedAt: receivedAt,
@@ -600,6 +773,9 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         let record = CameraRecord(device: camera, descriptor: descriptor)
         records[id] = record
         catalogTraces[id] = CatalogTrace()
+        logger.notice(
+            "camera_io session_requested camera_id=\(id, privacy: .public) usb_vendor_id=\(camera.usbVendorID, privacy: .public) usb_product_id=\(camera.usbProductID, privacy: .public) usb_location_id=\(camera.usbLocationID, privacy: .public) usb_speed=\(record.usbInfo.speed, privacy: .public) usb_probe_elapsed_ms=\(record.usbInfo.probeElapsed * 1000, privacy: .public)"
+        )
         camera.delegate = self
         publishDescriptors()
         startCatalogProgress(for: id)
@@ -649,7 +825,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         logger.notice(
             "camera_io catalog_refresh kind=complete action=accepted final=1 accepted=\(record.catalogRefreshAcceptedCount, privacy: .public) ignored=\(record.catalogRefreshIgnoredCount, privacy: .public) interval_seconds=\(Self.catalogRefreshInterval, privacy: .public)"
         )
-        updateCatalog(for: camera, isComplete: true)
+        updateCatalog(for: camera, isComplete: true, triggerReceivedAt: eventReceivedAt)
         record.catalogRefreshInFlight = false
     }
 
@@ -723,7 +899,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         logger.notice(
             "camera_io catalog_refresh kind=\(kind, privacy: .public) action=accepted accepted=\(record.catalogRefreshAcceptedCount, privacy: .public) ignored=\(record.catalogRefreshIgnoredCount, privacy: .public) interval_seconds=\(Self.catalogRefreshInterval, privacy: .public)"
         )
-        updateCatalog(for: camera, isComplete: false)
+        updateCatalog(for: camera, isComplete: false, triggerReceivedAt: receivedAt)
         record.catalogRefreshInFlight = false
     }
 
@@ -740,13 +916,19 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         )
     }
 
-    private func updateCatalog(for camera: ICCameraDevice, isComplete: Bool) {
+    private func updateCatalog(
+        for camera: ICCameraDevice,
+        isComplete: Bool,
+        triggerReceivedAt: Date
+    ) {
         let id = cameraIdentifier(camera)
         guard let record = records[id] else { return }
         let startedAt = Date()
         record.catalogUpdateStartedAt = startedAt
         record.catalogUpdateFinishedAt = nil
-        logger.notice("camera_io catalog_update_begin complete=\(isComplete ? 1 : 0, privacy: .public) media_files=\(camera.mediaFiles?.count ?? 0, privacy: .public) previous_groups=\(record.groups.count, privacy: .public)")
+        logger.notice(
+            "camera_io catalog_update_begin complete=\(isComplete ? 1 : 0, privacy: .public) trigger_to_begin_ms=\(startedAt.timeIntervalSince(triggerReceivedAt) * 1000, privacy: .public) media_files=\(camera.mediaFiles?.count ?? 0, privacy: .public) previous_groups=\(record.groups.count, privacy: .public)"
+        )
 
         var files = (camera.mediaFiles ?? []).compactMap { $0 as? ICCameraFile }
         // ImageCaptureCore exposes the JPG/CR3 relationship through
@@ -766,6 +948,11 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
                 files.append(raw)
             }
         }
+
+        let announcedFileBytes = catalogTraces[id]?.totalFileBytes ?? 0
+        logger.notice(
+            "camera_io catalog_update_input complete=\(isComplete ? 1 : 0, privacy: .public) media_files=\(files.count, privacy: .public) announced_file_bytes=\(announcedFileBytes, privacy: .public)"
+        )
 
         var pairedGroupKeys: [String: String] = [:]
         for file in files {
@@ -882,26 +1069,41 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         }
         let finishedAt = Date()
         record.catalogUpdateFinishedAt = finishedAt
-        logger.notice("camera_io catalog_update_end complete=\(isComplete ? 1 : 0, privacy: .public) groups=\(groups.count, privacy: .public) elapsed_ms=\(finishedAt.timeIntervalSince(startedAt) * 1000, privacy: .public)")
+        logger.notice(
+            "camera_io catalog_update_end complete=\(isComplete ? 1 : 0, privacy: .public) trigger_to_end_ms=\(finishedAt.timeIntervalSince(triggerReceivedAt) * 1000, privacy: .public) groups=\(groups.count, privacy: .public) files=\(files.count, privacy: .public) announced_file_bytes=\(announcedFileBytes, privacy: .public) elapsed_ms=\(finishedAt.timeIntervalSince(startedAt) * 1000, privacy: .public)"
+        )
     }
 
-    private func traceCatalogInput(for camera: ICCameraDevice, itemCount: Int, receivedAt: Date) {
+    private func traceCatalogInput(for camera: ICCameraDevice, items: [ICCameraItem], receivedAt: Date) {
         let id = cameraIdentifier(camera)
         var trace = catalogTraces[id, default: CatalogTrace()]
         let now = receivedAt
         if trace.windowStartedAt == nil { trace.windowStartedAt = receivedAt }
+        if trace.firstInputAt == nil { trace.firstInputAt = receivedAt }
+        trace.lastInputAt = receivedAt
+        let inputFileBytes = CameraCatalogSummary.fileBytes(in: items)
         trace.totalCallbacks += 1
-        trace.totalItems += itemCount
+        trace.totalItems += items.count
+        trace.totalFileBytes += inputFileBytes
         trace.windowCallbacks += 1
-        trace.windowItems += itemCount
+        trace.windowItems += items.count
+        trace.windowFileBytes += inputFileBytes
 
         let shouldReport = trace.lastReportedAt == nil
             || now.timeIntervalSince(trace.lastReportedAt!) >= 1
         if shouldReport {
             let windowSeconds = now.timeIntervalSince(trace.windowStartedAt ?? now)
-            logger.notice("camera_io catalog_input window_callbacks=\(trace.windowCallbacks, privacy: .public) window_items=\(trace.windowItems, privacy: .public) total_callbacks=\(trace.totalCallbacks, privacy: .public) total_items=\(trace.totalItems, privacy: .public) window_seconds=\(windowSeconds, privacy: .public) percent=\(Int(camera.contentCatalogPercentCompleted), privacy: .public)")
+            let sessionSeconds = record(for: camera).map { now.timeIntervalSince($0.sessionRequestedAt) } ?? 0
+            let firstInputSeconds = now.timeIntervalSince(trace.firstInputAt ?? now)
+            let windowBytesPerSecond = windowSeconds > 0 ? Double(trace.windowFileBytes) / windowSeconds : 0
+            let sessionBytesPerSecond = sessionSeconds > 0 ? Double(trace.totalFileBytes) / sessionSeconds : 0
+            let streamBytesPerSecond = firstInputSeconds > 0 ? Double(trace.totalFileBytes) / firstInputSeconds : 0
+            logger.notice(
+                "camera_io catalog_input session_elapsed_seconds=\(sessionSeconds, privacy: .public) stream_elapsed_seconds=\(firstInputSeconds, privacy: .public) window_callbacks=\(trace.windowCallbacks, privacy: .public) window_items=\(trace.windowItems, privacy: .public) window_file_bytes=\(trace.windowFileBytes, privacy: .public) window_bytes_per_second=\(windowBytesPerSecond, privacy: .public) total_callbacks=\(trace.totalCallbacks, privacy: .public) total_items=\(trace.totalItems, privacy: .public) total_file_bytes=\(trace.totalFileBytes, privacy: .public) session_bytes_per_second=\(sessionBytesPerSecond, privacy: .public) stream_bytes_per_second=\(streamBytesPerSecond, privacy: .public) window_seconds=\(windowSeconds, privacy: .public) percent=\(Int(camera.contentCatalogPercentCompleted), privacy: .public)"
+            )
             trace.windowCallbacks = 0
             trace.windowItems = 0
+            trace.windowFileBytes = 0
             trace.windowStartedAt = now
             trace.lastReportedAt = now
         }
@@ -912,10 +1114,20 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         let id = cameraIdentifier(camera)
         guard var trace = catalogTraces[id], trace.windowCallbacks > 0 else { return }
         let now = Date()
+        let lastInputAt = trace.lastInputAt ?? now
         let windowSeconds = now.timeIntervalSince(trace.windowStartedAt ?? now)
-        logger.notice("camera_io catalog_input_final window_callbacks=\(trace.windowCallbacks, privacy: .public) window_items=\(trace.windowItems, privacy: .public) total_callbacks=\(trace.totalCallbacks, privacy: .public) total_items=\(trace.totalItems, privacy: .public) window_seconds=\(windowSeconds, privacy: .public) percent=\(Int(camera.contentCatalogPercentCompleted), privacy: .public)")
+        let sessionSeconds = record(for: camera).map { lastInputAt.timeIntervalSince($0.sessionRequestedAt) } ?? 0
+        let firstInputSeconds = lastInputAt.timeIntervalSince(trace.firstInputAt ?? lastInputAt)
+        let inputToFlushMilliseconds = now.timeIntervalSince(lastInputAt) * 1000
+        let windowBytesPerSecond = windowSeconds > 0 ? Double(trace.windowFileBytes) / windowSeconds : 0
+        let sessionBytesPerSecond = sessionSeconds > 0 ? Double(trace.totalFileBytes) / sessionSeconds : 0
+        let streamBytesPerSecond = firstInputSeconds > 0 ? Double(trace.totalFileBytes) / firstInputSeconds : 0
+        logger.notice(
+            "camera_io catalog_input_final session_elapsed_seconds=\(sessionSeconds, privacy: .public) stream_elapsed_seconds=\(firstInputSeconds, privacy: .public) input_to_flush_ms=\(inputToFlushMilliseconds, privacy: .public) window_callbacks=\(trace.windowCallbacks, privacy: .public) window_items=\(trace.windowItems, privacy: .public) window_file_bytes=\(trace.windowFileBytes, privacy: .public) window_bytes_per_second=\(windowBytesPerSecond, privacy: .public) total_callbacks=\(trace.totalCallbacks, privacy: .public) total_items=\(trace.totalItems, privacy: .public) total_file_bytes=\(trace.totalFileBytes, privacy: .public) session_bytes_per_second=\(sessionBytesPerSecond, privacy: .public) stream_bytes_per_second=\(streamBytesPerSecond, privacy: .public) window_seconds=\(windowSeconds, privacy: .public) percent=\(Int(camera.contentCatalogPercentCompleted), privacy: .public)"
+        )
         trace.windowCallbacks = 0
         trace.windowItems = 0
+        trace.windowFileBytes = 0
         trace.windowStartedAt = now
         trace.lastReportedAt = now
         catalogTraces[id] = trace

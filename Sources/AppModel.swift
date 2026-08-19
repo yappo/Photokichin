@@ -1375,7 +1375,10 @@ final class AppModel: ObservableObject {
     }
 
     func openLibrary(_ url: URL) {
-        guard !isBusy, !isScanning else {
+        // Source scans are cancellable: scan(url:) invalidates the current
+        // token and waits for the old metadata/thumbnail I/O before exposing
+        // the library. Only an actual file operation must block navigation.
+        guard !isBusy else {
             errorMessage = "処理中はライブラリを切り替えられません。"
             return
         }
