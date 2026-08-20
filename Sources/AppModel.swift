@@ -100,6 +100,8 @@ final class AppModel: ObservableObject {
     }
     @Published var sourceURL: URL?
     @Published var sourceVolume: MountedVolume?
+    @Published var sourceCamera: CameraDescriptor?
+    @Published private(set) var cameras: [CameraDescriptor] = []
     @Published var libraryURL: URL?
     @Published private(set) var libraryURLs: [URL] = []
     @Published var isScanning = false
@@ -136,6 +138,7 @@ final class AppModel: ObservableObject {
     @Published var copyLabelsOnLibraryCopy = true
 
     let volumeMonitor = VolumeMonitor()
+    let cameraMonitor = CameraMonitor.shared
     private var catalog: CatalogStore?
     private var targetCatalog: CatalogStore?
     private var groupByID: [String: PhotoGroup] = [:]
@@ -203,6 +206,33 @@ final class AppModel: ObservableObject {
         volumeMonitor.onUnmount = { [weak self] volumeURL in
             self?.handleUnmountedVolume(volumeURL)
         }
+        cameraMonitor.onCameraReady = { [weak self] descriptor, groups in
+            guard let self,
+                  self.sourceCamera?.id == descriptor.id,
+                  !self.isBusy else { return }
+            self.updateVisibleCameraCatalog(descriptor, groups: groups, isComplete: true)
+        }
+        cameraMonitor.onCameraCatalogUpdate = { [weak self] descriptor, groups in
+            guard let self,
+                  self.sourceCamera?.id == descriptor.id,
+                  !self.isBusy else { return }
+            self.updateVisibleCameraCatalog(descriptor, groups: groups, isComplete: false)
+        }
+        cameraMonitor.onCameraRemoved = { [weak self] cameraID in
+            self?.handleRemovedCamera(cameraID)
+        }
+        cameraMonitor.onCamerasChanged = { [weak self] cameras in
+            guard let self else { return }
+            self.cameras = cameras
+            if let sourceCamera = self.sourceCamera,
+               let updated = cameras.first(where: { $0.id == sourceCamera.id }) {
+                self.sourceCamera = updated
+            }
+        }
+        cameraMonitor.onError = { [weak self] message in
+            self?.errorMessage = message
+        }
+        cameraMonitor.start()
     }
 
     deinit {
@@ -272,6 +302,15 @@ final class AppModel: ObservableObject {
         return libraryURLs.contains { $0.standardizedFileURL == sourceURL.standardizedFileURL }
     }
 
+    var isCameraSource: Bool { sourceCamera != nil }
+
+    var isCameraCataloging: Bool { sourceCamera?.isCataloging == true }
+
+    var canDeleteSourceFiles: Bool {
+        if sourceVolume != nil { return true }
+        return sourceCamera?.canDeleteFiles == true
+    }
+
     private var catalogRootURL: URL? {
         isLibraryView ? sourceURL : libraryURL
     }
@@ -290,6 +329,12 @@ final class AppModel: ObservableObject {
 
     var activeLabels: [PhotoLabel] {
         labels.filter { activeLabelIDs.contains($0.id) }
+    }
+
+    var availableImportFilters: [PhotoImportFilter] {
+        PhotoImportFilter.allCases.filter { filter in
+            filter != .possible || isCameraSource
+        }
     }
 
     /// Custom command-menu shortcuts must be disabled while a label sheet is
@@ -357,6 +402,7 @@ final class AppModel: ObservableObject {
     }
 
     func markDeleteCandidates(in photos: [PhotoGroup]) {
+        guard canDeleteSourceFiles else { return }
         let ids = photos.map(\.id)
         deleteCandidateIDs.formUnion(ids)
         selectedIDs.subtract(ids)
@@ -439,6 +485,13 @@ final class AppModel: ObservableObject {
         }
         focusedIDs = [first.id]
         lastFocusedID = first.id
+        requestMetadataForCurrentCameraFocus()
+    }
+
+    private func requestMetadataForCurrentCameraFocus() {
+        guard isCameraSource,
+              let focusedGroup = navigationFocusedGroup else { return }
+        prioritizeMetadata(for: focusedGroup.id, priority: .viewerCurrent)
     }
 
     var selectedCountText: String {
@@ -687,6 +740,7 @@ final class AppModel: ObservableObject {
             focusScrollEdge = .end
         }
         focusScrollRevision &+= 1
+        requestMetadataForCurrentCameraFocus()
     }
 
     func moveFocusPage(direction: FocusDirection) {
@@ -719,6 +773,7 @@ final class AppModel: ObservableObject {
         userMovedFocusForCurrentSource = true
         focusScrollEdge = direction == .down ? .end : .beginning
         focusScrollRevision &+= 1
+        requestMetadataForCurrentCameraFocus()
     }
 
     private var navigationFocusedGroup: PhotoGroup? {
@@ -751,11 +806,13 @@ final class AppModel: ObservableObject {
         // observing only focusedIDs would correctly emit no event while the
         // visible scroll position could still be elsewhere.
         focusScrollRevision &+= 1
+        requestMetadataForCurrentCameraFocus()
     }
 
     func scan(url: URL, volume: MountedVolume? = nil) {
         let cancelledProcessing = invalidateSourceProcessing()
         let token = currentScanToken
+        sourceCamera = nil
         if let previousSourcePath = sourceURL?.path {
             browsingStateBySourcePath[previousSourcePath] = SourceBrowsingState(
                 importFilter: importFilter,
@@ -928,6 +985,157 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func scan(camera descriptor: CameraDescriptor) {
+        guard descriptor.isReady else {
+            errorMessage = "カメラとの接続を準備しています。接続が完了すると写真一覧を開けます。"
+            return
+        }
+        let cameraGroups = cameraMonitor.groups(for: descriptor.id) ?? []
+
+        let cancelledProcessing = invalidateSourceProcessing()
+        let token = currentScanToken
+        let cameraURL = CameraMonitor.sourceURL(for: descriptor.id)
+        if let previousSourcePath = sourceURL?.path {
+            browsingStateBySourcePath[previousSourcePath] = SourceBrowsingState(
+                importFilter: importFilter,
+                operationFilter: operationFilter,
+                focusedIDs: focusedIDs,
+                lastFocusedID: lastFocusedID
+            )
+        }
+        closeViewer()
+        CameraThumbnailCoordinator.shared.cancelAll()
+        userMovedFocusForCurrentSource = false
+        focusedIDs.removeAll()
+        focusBeforeFilter = nil
+        lastFocusBeforeFilter = nil
+        selectedIDs.removeAll()
+        deleteCandidateIDs.removeAll()
+        activeLabelIDs.removeAll()
+        activeSavedLabelViewID = nil
+        labels.removeAll()
+        savedLabelViews.removeAll()
+        photoIDsByLabelID.removeAll()
+        let restoredState = browsingStateBySourcePath[cameraURL.path]
+        importFilter = restoredState?.importFilter ?? .all
+        operationFilter = restoredState?.operationFilter ?? .all
+        pendingRestoredFocusIDs = restoredState?.focusedIDs ?? []
+        pendingRestoredLastFocusID = restoredState?.lastFocusedID
+        sourceURL = cameraURL
+        sourceVolume = nil
+        sourceCamera = descriptor
+        isScanning = true
+        progressText = cameraGroups.isEmpty
+            ? "USBカメラの写真一覧を準備しています…"
+            : String(cameraGroups.count) + "組を表示中・追加読み込み中"
+        groups = cameraGroups
+        rebuildGroupedPhotos()
+        if !cameraGroups.isEmpty {
+            focusFirstVisiblePhoto()
+        }
+
+        scanTask = Task { [weak self] in
+            await cancelledProcessing.waitForIOToStop()
+            await MetadataLoadingCoordinator.shared.quiesce()
+            await ThumbnailLoadingCoordinator.shared.quiesce()
+            guard let self, !Task.isCancelled, self.currentScanToken == token else { return }
+
+            MetadataLoadingCoordinator.shared.resumeAfterQuiesce()
+            ThumbnailLoadingCoordinator.shared.beginSource(rootURL: cameraURL)
+            guard !Task.isCancelled, self.currentScanToken == token else { return }
+            if !cameraGroups.isEmpty {
+                self.updateVisibleCameraCatalog(descriptor, groups: cameraGroups, isComplete: !descriptor.isCataloging)
+            } else if !descriptor.isCataloging {
+                self.updateVisibleCameraCatalog(descriptor, groups: [], isComplete: true)
+            }
+            if self.currentScanToken == token {
+                self.scanTask = nil
+            }
+        }
+    }
+
+    private func updateVisibleCameraCatalog(_ descriptor: CameraDescriptor, groups: [PhotoGroup], isComplete: Bool) {
+        guard sourceCamera?.id == descriptor.id else { return }
+        sourceCamera = descriptor
+        guard sourceURL?.path == CameraMonitor.sourceURL(for: descriptor.id).path else { return }
+
+        scanTask?.cancel()
+        scanTask = nil
+        self.groups = groups
+        rebuildGroupedPhotos()
+        if let importCatalog = targetCatalog {
+            scheduleImportStateEnrichment(
+                groups: groups,
+                isLibraryView: false,
+                catalog: importCatalog,
+                targetCatalog: importCatalog,
+                sourceRoot: sourceURL,
+                targetRoot: libraryURL,
+                volumeUUID: nil,
+                token: currentScanToken
+            )
+        }
+        let availableIDs = Set(groups.map(\.id))
+        let retainedFocusedIDs = focusedIDs.intersection(availableIDs)
+        if groups.isEmpty {
+            focusedIDs.removeAll()
+            lastFocusedID = nil
+        } else if !retainedFocusedIDs.isEmpty {
+            focusedIDs = retainedFocusedIDs
+            if let lastFocusedID, retainedFocusedIDs.contains(lastFocusedID) == false {
+                self.lastFocusedID = retainedFocusedIDs.first
+            }
+        } else if !userMovedFocusForCurrentSource {
+            let restoredIDs = pendingRestoredFocusIDs.intersection(availableIDs)
+            if !restoredIDs.isEmpty {
+                focusedIDs = restoredIDs
+                lastFocusedID = pendingRestoredLastFocusID.flatMap {
+                    availableIDs.contains($0) ? $0 : nil
+                } ?? restoredIDs.first
+                userMovedFocusForCurrentSource = true
+            } else if !groups.isEmpty {
+                focusFirstVisiblePhoto()
+            }
+        } else if !groups.isEmpty {
+            focusFirstVisiblePhoto()
+        }
+        pendingRestoredFocusIDs.removeAll(keepingCapacity: true)
+        pendingRestoredLastFocusID = nil
+        isScanning = !isComplete
+        progressText = isComplete
+            ? String(groups.count) + "組を表示中"
+            : String(groups.count) + "組を表示中・追加読み込み中"
+    }
+
+    private func updateCameraMetadata(_ metadata: PhotoMetadata?, for groupID: String) {
+        guard let index = groupIndexByID[groupID] else { return }
+        var updated = groups[index]
+        if let metadata {
+            var merged = updated.metadata
+            merged.captureDate = metadata.captureDate ?? merged.captureDate
+            merged.cameraMake = metadata.cameraMake ?? merged.cameraMake
+            merged.cameraModel = metadata.cameraModel ?? merged.cameraModel
+            merged.lensModel = metadata.lensModel ?? merged.lensModel
+            merged.focalLength = metadata.focalLength ?? merged.focalLength
+            merged.aperture = metadata.aperture ?? merged.aperture
+            merged.shutterSpeed = metadata.shutterSpeed ?? merged.shutterSpeed
+            merged.iso = metadata.iso ?? merged.iso
+            merged.exposureBias = metadata.exposureBias ?? merged.exposureBias
+            merged.orientation = metadata.orientation ?? merged.orientation
+            merged.gps = metadata.gps ?? merged.gps
+            merged.firmware = metadata.firmware ?? merged.firmware
+            merged.pixelWidth = metadata.pixelWidth ?? merged.pixelWidth
+            merged.pixelHeight = metadata.pixelHeight ?? merged.pixelHeight
+            updated.metadata = merged
+            if let captureDate = merged.captureDate {
+                updated.captureDate = captureDate
+            }
+        }
+        updated.isMetadataLoaded = true
+        groups[index] = updated
+        rebuildGroupedPhotos()
+    }
+
     @discardableResult
     private func invalidateSourceProcessing() -> CancelledSourceProcessing {
         let cancelled = CancelledSourceProcessing(
@@ -992,6 +1200,34 @@ final class AppModel: ObservableObject {
             await cancelledProcessing.waitForIOToStop()
             await MetadataLoadingCoordinator.shared.quiesce()
             await ThumbnailLoadingCoordinator.shared.quiesce()
+        }
+    }
+
+    private func handleRemovedCamera(_ cameraID: String) {
+        guard sourceCamera?.id == cameraID else { return }
+        let cancelledProcessing = invalidateSourceProcessing()
+        closeViewer()
+        groups.removeAll()
+        groupedPhotos.removeAll()
+        filteredGroupedPhotos.removeAll()
+        focusedIDs.removeAll()
+        selectedIDs.removeAll()
+        deleteCandidateIDs.removeAll()
+        sourceURL = nil
+        sourceVolume = nil
+        sourceCamera = nil
+        isScanning = false
+        isBusy = false
+        isCancellingImport = false
+        importCancellation = nil
+        importTask = nil
+        operationProgress = nil
+        progressText = "USBカメラが取り外されました"
+        Task {
+            await cancelledProcessing.waitForIOToStop()
+            await MetadataLoadingCoordinator.shared.quiesce()
+            await ThumbnailLoadingCoordinator.shared.quiesce()
+            CameraThumbnailCoordinator.shared.cancelAll()
         }
     }
 
@@ -1139,7 +1375,10 @@ final class AppModel: ObservableObject {
     }
 
     func openLibrary(_ url: URL) {
-        guard !isBusy, !isScanning else {
+        // Source scans are cancellable: scan(url:) invalidates the current
+        // token and waits for the old metadata/thumbnail I/O before exposing
+        // the library. Only an actual file operation must block navigation.
+        guard !isBusy else {
             errorMessage = "処理中はライブラリを切り替えられません。"
             return
         }
@@ -1378,6 +1617,10 @@ final class AppModel: ObservableObject {
 
     func importSelected(to destination: URL, template: String) {
         guard !selectedGroups.isEmpty else { errorMessage = AppError.noSelectedPhotos.localizedDescription; return }
+        if isCameraSource {
+            importSelectedFromCamera(to: destination, template: template)
+            return
+        }
         isBusy = true
         lastImportResults = []
         importTemplate = template
@@ -1496,6 +1739,181 @@ final class AppModel: ObservableObject {
             operationProgress = nil
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func importSelectedFromCamera(to destination: URL, template: String) {
+        guard sourceCamera != nil else {
+            errorMessage = "USBカメラが選択されていません。"
+            return
+        }
+        isBusy = true
+        lastImportResults = []
+        importTemplate = template
+        let destinationURL = registerLibrary(destination)
+        libraryURL = destinationURL
+        persistLibrarySelection()
+
+        do {
+            let store = try CatalogStore(libraryRoot: destinationURL)
+            catalog = store
+            targetCatalog = store
+            let groupsToImport = selectedGroups
+            let operationToken = currentScanToken
+            let totalImportFiles = groupsToImport.reduce(0) { $0 + $1.importableVariants.count }
+            operationProgress = OperationProgress(
+                title: "取り込み中",
+                completedGroups: 0,
+                totalGroups: groupsToImport.count,
+                completedFiles: 0,
+                totalFiles: totalImportFiles
+            )
+            let cancellation = ImportCancellationToken()
+            importCancellation = cancellation
+            isCancellingImport = false
+            importTask = Task { [weak self] in
+                guard let self else { return }
+                var results: [ImportResult] = []
+                var completed = 0
+                var completedFiles = 0
+
+                for group in groupsToImport {
+                    guard !cancellation.isCancelled,
+                          self.currentScanToken == operationToken else { break }
+                    let result = await self.importCameraGroup(
+                        group,
+                        destination: destinationURL,
+                        template: template,
+                        catalog: store,
+                        cancellation: cancellation
+                    )
+                    results.append(result)
+                    completed += 1
+                    completedFiles += group.importableVariants.count
+                    self.operationProgress = OperationProgress(
+                        title: "取り込み中",
+                        completedGroups: completed,
+                        totalGroups: groupsToImport.count,
+                        completedFiles: completedFiles,
+                        totalFiles: totalImportFiles
+                    )
+                    self.progressText = "取り込み中… \(completed)/\(groupsToImport.count)  \(group.basename)"
+                    if result.failedCount == 0 && !group.importableVariants.isEmpty {
+                        self.markCameraGroupImported(group.id)
+                    }
+                }
+
+                guard self.currentScanToken == operationToken else { return }
+                self.lastImportResults = results
+                self.isBusy = false
+                self.isCancellingImport = false
+                self.importCancellation = nil
+                self.importTask = nil
+                self.operationProgress = nil
+                if cancellation.isCancelled {
+                    self.focusNextPendingImport()
+                    self.progressText = "取り込みを中断しました（\(completed)/\(groupsToImport.count)組）"
+                    return
+                }
+                let failures = results.filter { $0.failedCount > 0 }.count
+                self.focusNextPendingImport()
+                self.progressText = failures == 0 ? "取り込みが完了しました" : "取り込み完了（一部失敗あり）"
+            }
+        } catch {
+            isBusy = false
+            operationProgress = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func importCameraGroup(
+        _ group: PhotoGroup,
+        destination: URL,
+        template: String,
+        catalog: CatalogStore,
+        cancellation: ImportCancellationToken
+    ) async -> ImportResult {
+        let date = group.metadata.captureDate ?? group.captureDate ?? Date()
+        let folderName = FileTransferService.shared.makeFolderName(
+            template: template,
+            date: date,
+            camera: group.metadata.cameraModel ?? "EOS R"
+        )
+        let destinationDirectory = destination.appendingPathComponent(folderName, isDirectory: true)
+        do {
+            try cancellation.check()
+            try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+            var copied = 0
+            var skipped = 0
+            var failed = 0
+            var messages: [String] = []
+
+            for variant in group.importableVariants {
+                try cancellation.check()
+                guard let asset = group.cameraReference?.asset(for: variant) else { continue }
+                var partialURL: URL?
+                do {
+                    partialURL = try await cameraMonitor.download(
+                        group: group,
+                        variant: variant,
+                        to: destinationDirectory,
+                        filename: ".photokichin-partial-\(UUID().uuidString)"
+                    )
+                    let destinationURL = destinationDirectory.appendingPathComponent(asset.filename)
+                    let sourceKey = cameraMonitor.catalogSourceKey(for: group, variant: variant)
+                    let installed = try await Task.detached(priority: .userInitiated) {
+                        try FileTransferService.shared.installCameraDownloadedFile(
+                            partialURL: partialURL!,
+                            destinationURL: destinationURL,
+                            variant: variant,
+                            sourceKey: sourceKey,
+                            sourceFilename: asset.filename,
+                            catalog: catalog,
+                            expectedFileSize: asset.fileSize,
+                            cancellation: cancellation
+                        )
+                    }.value
+                    partialURL = nil
+                    if installed { copied += 1 } else { skipped += 1 }
+                } catch is CancellationError {
+                    if let partialURL { try? FileManager.default.removeItem(at: partialURL) }
+                    throw CancellationError()
+                } catch {
+                    if let partialURL { try? FileManager.default.removeItem(at: partialURL) }
+                    failed += 1
+                    messages.append("\(asset.filename): \(error.localizedDescription)")
+                }
+            }
+
+            let message = messages.isEmpty
+                ? "\(group.basename): \(copied)件取り込み、\(skipped)件スキップ"
+                : "\(group.basename): \(messages.joined(separator: " / "))"
+            return ImportResult(groupID: group.id, message: message, copiedCount: copied, skippedCount: skipped, failedCount: failed)
+        } catch is CancellationError {
+            return ImportResult(
+                groupID: group.id,
+                message: "取り込みを中断しました",
+                copiedCount: 0,
+                skippedCount: 0,
+                failedCount: 1
+            )
+        } catch {
+            return ImportResult(
+                groupID: group.id,
+                message: error.localizedDescription,
+                copiedCount: 0,
+                skippedCount: 0,
+                failedCount: 1
+            )
+        }
+    }
+
+    private func markCameraGroupImported(_ groupID: String) {
+        guard let index = groupIndexByID[groupID] else { return }
+        var updated = groups[index]
+        if updated.importableVariants.contains(.jpeg) { updated.importedJPEG = true }
+        if updated.importableVariants.contains(.raw) { updated.importedRAW = true }
+        groups[index] = updated
+        rebuildGroupedPhotos()
     }
 
     func cancelImport() {
@@ -1633,6 +2051,10 @@ final class AppModel: ObservableObject {
     }
 
     func deleteCandidatesFromCard() {
+        guard sourceVolume != nil else {
+            errorMessage = "削除対象のソースが選択されていません。"
+            return
+        }
         guard !deleteCandidateGroups.isEmpty else { errorMessage = AppError.noDeleteCandidates.localizedDescription; return }
         let groupsToDelete = deleteCandidateGroups
         let cancelledProcessing = invalidateSourceProcessing()
@@ -1689,6 +2111,101 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Called only by the explicit destructive confirmation in the UI.
+    func deleteCandidatesAfterConfirmation() {
+        guard canDeleteSourceFiles else {
+            errorMessage = "このソースのファイル削除には対応していません。"
+            return
+        }
+        if sourceCamera != nil {
+            deleteCandidatesFromCamera()
+        } else {
+            deleteCandidatesFromCard()
+        }
+    }
+
+    private func deleteCandidatesFromCamera() {
+        guard let sourceCamera,
+              sourceCamera.canDeleteFiles else {
+            errorMessage = "このカメラはファイル削除に対応していません。"
+            return
+        }
+        guard !deleteCandidateGroups.isEmpty else {
+            errorMessage = AppError.noDeleteCandidates.localizedDescription
+            return
+        }
+
+        let groupsToDelete = deleteCandidateGroups
+        let cancelledProcessing = invalidateSourceProcessing()
+        let operationToken = currentScanToken
+        let totalFiles = groupsToDelete.reduce(0) { $0 + $1.importableVariants.count }
+        isBusy = true
+        operationProgress = OperationProgress(
+            title: "カメラから削除中",
+            completedGroups: 0,
+            totalGroups: groupsToDelete.count,
+            completedFiles: 0,
+            totalFiles: totalFiles
+        )
+        progressText = "カメラから\(totalFiles)ファイルを削除中…"
+
+        Task { [weak self] in
+            await cancelledProcessing.waitForIOToStop()
+            await MetadataLoadingCoordinator.shared.quiesce()
+            await ThumbnailLoadingCoordinator.shared.quiesce()
+            guard let self, self.currentScanToken == operationToken else { return }
+
+            var completedGroups = 0
+            var processedFiles = 0
+            var failedFiles = 0
+            var failureMessages: [String] = []
+
+            for group in groupsToDelete {
+                var groupFailed = false
+                for variant in group.importableVariants {
+                    do {
+                        try await self.cameraMonitor.delete(group: group, variant: variant)
+                    } catch {
+                        groupFailed = true
+                        failedFiles += 1
+                        failureMessages.append("\(group.basename) \(variant.rawValue): \(error.localizedDescription)")
+                    }
+                    processedFiles += 1
+                    self.operationProgress = OperationProgress(
+                        title: "カメラから削除中",
+                        completedGroups: completedGroups,
+                        totalGroups: groupsToDelete.count,
+                        completedFiles: processedFiles,
+                        totalFiles: totalFiles
+                    )
+                }
+                if !groupFailed { completedGroups += 1 }
+                self.operationProgress = OperationProgress(
+                    title: "カメラから削除中",
+                    completedGroups: completedGroups,
+                    totalGroups: groupsToDelete.count,
+                    completedFiles: processedFiles,
+                    totalFiles: totalFiles
+                )
+            }
+
+            guard self.currentScanToken == operationToken else { return }
+            self.isBusy = false
+            self.operationProgress = nil
+            self.deleteCandidateIDs.removeAll()
+            if failedFiles == 0 {
+                self.progressText = "\(completedGroups)組をカメラから削除しました"
+            } else {
+                self.progressText = "カメラからの削除完了（\(failedFiles)件失敗）"
+                self.errorMessage = failureMessages.prefix(3).joined(separator: "\n")
+            }
+
+            if let refreshedDescriptor = self.cameraMonitor.descriptor(for: sourceCamera.id) {
+                self.scan(camera: refreshedDescriptor)
+            }
+        }
+    }
+
     func airDrop(mode: AirDropMode) {
         guard !selectedGroups.isEmpty else { errorMessage = AppError.noSelectedPhotos.localizedDescription; return }
         guard airDropSession == nil, !isBusy else { return }
@@ -1713,6 +2230,56 @@ final class AppModel: ObservableObject {
     }
 
     func ejectCurrentVolume() {
+        if let sourceCamera {
+            guard sourceCamera.canEject else {
+                errorMessage = "このカメラは安全な取り出しに対応していません。"
+                return
+            }
+            guard !isBusy, !isScanning else {
+                errorMessage = "処理が終わるまでEjectできません。"
+                return
+            }
+
+            let camera = sourceCamera
+            let operationToken = currentScanToken
+            isBusy = true
+            progressText = "カメラへのIOを停止しています…"
+            Task { [weak self] in
+                await MetadataLoadingCoordinator.shared.quiesce()
+                await ThumbnailLoadingCoordinator.shared.quiesce()
+
+                guard let self,
+                      self.currentScanToken == operationToken,
+                      self.sourceCamera?.id == camera.id else {
+                    MetadataLoadingCoordinator.shared.resumeAfterQuiesce()
+                    ThumbnailLoadingCoordinator.shared.resumeAfterQuiesce()
+                    self?.isBusy = false
+                    return
+                }
+
+                self.progressText = "安全にEjectしています…"
+                do {
+                    try await self.cameraMonitor.eject(id: camera.id)
+                    MetadataLoadingCoordinator.shared.resumeAfterQuiesce()
+                    ThumbnailLoadingCoordinator.shared.resumeAfterQuiesce()
+                    self.groups.removeAll()
+                    self.selectedIDs.removeAll()
+                    self.focusedIDs.removeAll()
+                    self.deleteCandidateIDs.removeAll()
+                    self.sourceURL = nil
+                    self.sourceCamera = nil
+                    self.isBusy = false
+                    self.progressText = "Ejectしました"
+                } catch {
+                    MetadataLoadingCoordinator.shared.resumeAfterQuiesce()
+                    ThumbnailLoadingCoordinator.shared.resumeAfterQuiesce()
+                    self.isBusy = false
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+            return
+        }
+
         guard let sourceURL, sourceVolume != nil else { errorMessage = AppError.noSource.localizedDescription; return }
         guard !isBusy, !isScanning else { errorMessage = "処理が終わるまでEjectできません。"; return }
         let sourceVolume = self.sourceVolume
@@ -1777,12 +2344,14 @@ final class AppModel: ObservableObject {
             focusedIDs = [group.id]
         }
         lastFocusedID = group.id
+        requestMetadataForCurrentCameraFocus()
     }
 
     func setFocus(ids: Set<String>) {
         userMovedFocusForCurrentSource = true
         focusedIDs = ids
         lastFocusedID = groups.first(where: { ids.contains($0.id) })?.id
+        requestMetadataForCurrentCameraFocus()
     }
 
     func toggleFocusedSelection() {
@@ -1791,7 +2360,7 @@ final class AppModel: ObservableObject {
     }
 
     func toggleFocusedDeleteCandidate() {
-        guard !focusedIDs.isEmpty else { return }
+        guard canDeleteSourceFiles, !focusedIDs.isEmpty else { return }
         toggleDeleteCandidate(for: focusedIDs)
     }
 
@@ -1826,7 +2395,7 @@ final class AppModel: ObservableObject {
     }
 
     private func toggleDeleteCandidate(for ids: Set<String>) {
-        guard !ids.isEmpty else { return }
+        guard canDeleteSourceFiles, !ids.isEmpty else { return }
         let shouldRemove = ids.allSatisfy { deleteCandidateIDs.contains($0) }
         if shouldRemove {
             deleteCandidateIDs.subtract(ids)
@@ -2066,6 +2635,8 @@ final class AppModel: ObservableObject {
                 var current = self.groupByID[enrichedGroup.id] ?? merged[index]
                 current.importedJPEG = enrichedGroup.importedJPEG
                 current.importedRAW = enrichedGroup.importedRAW
+                current.possibleImportedJPEG = enrichedGroup.possibleImportedJPEG
+                current.possibleImportedRAW = enrichedGroup.possibleImportedRAW
                 current.libraryAssetStatus = enrichedGroup.libraryAssetStatus
                 merged[index] = current
             }
@@ -2099,6 +2670,46 @@ final class AppModel: ObservableObject {
         volumeUUID: String?
     ) -> PhotoGroup {
         var updated = group
+        if group.isCameraBacked {
+            updated.libraryAssetStatus = .notApplicable
+            updated.importedJPEG = false
+            updated.importedRAW = false
+            updated.possibleImportedJPEG = false
+            updated.possibleImportedRAW = false
+            guard let catalog = targetCatalog,
+                  let reference = group.cameraReference else { return updated }
+            if let asset = reference.asset(for: .jpeg) {
+                let sourceKey = CameraMonitor.catalogSourceKey(
+                    cameraID: reference.cameraID,
+                    groupKey: reference.groupKey,
+                    variant: .jpeg
+                )
+                updated.importedJPEG = catalog.isImported(sourceKey: sourceKey, variant: .jpeg)
+                if !updated.importedJPEG {
+                    updated.possibleImportedJPEG = !catalog.matchCandidates(
+                        sourceFilenameKey: FilenameIdentity.key(for: asset.filename),
+                        fileSize: asset.fileSize,
+                        variant: .jpeg
+                    ).isEmpty
+                }
+            }
+            if let asset = reference.asset(for: .raw) {
+                let sourceKey = CameraMonitor.catalogSourceKey(
+                    cameraID: reference.cameraID,
+                    groupKey: reference.groupKey,
+                    variant: .raw
+                )
+                updated.importedRAW = catalog.isImported(sourceKey: sourceKey, variant: .raw)
+                if !updated.importedRAW {
+                    updated.possibleImportedRAW = !catalog.matchCandidates(
+                        sourceFilenameKey: FilenameIdentity.key(for: asset.filename),
+                        fileSize: asset.fileSize,
+                        variant: .raw
+                    ).isEmpty
+                }
+            }
+            return updated
+        }
         if isLibraryView {
             // EXT is a property of the source library itself. Import state,
             // including the green checkmark, is a property of the target
@@ -2121,12 +2732,16 @@ final class AppModel: ObservableObject {
             let sourceManaged = [jpegSourceManaged, rawSourceManaged].filter { $0 }.count
             updated.importedJPEG = jpegTargetManaged
             updated.importedRAW = rawTargetManaged
+            updated.possibleImportedJPEG = false
+            updated.possibleImportedRAW = false
             updated.libraryAssetStatus = sourceManaged == 0 ? .unregistered : (sourceManaged == available ? .registered : .partial)
             return updated
         }
         updated.libraryAssetStatus = .notApplicable
         updated.importedJPEG = false
         updated.importedRAW = false
+        updated.possibleImportedJPEG = false
+        updated.possibleImportedRAW = false
         guard let catalog else { return updated }
         if let jpegURL = group.jpegURL {
             let sourceKey = SourceIdentity.key(url: jpegURL, variant: .jpeg, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
@@ -2170,7 +2785,7 @@ final class AppModel: ObservableObject {
         guard !isLibraryView else { return }
         guard let next = groups.first(where: { group in
             switch group.cardImportState {
-            case .notImported, .partial: return true
+            case .notImported, .possible, .partial: return true
             case .imported, .notApplicable: return false
             }
         }) else { return }
@@ -2290,6 +2905,27 @@ final class AppModel: ObservableObject {
 
     func prioritizeMetadata(for groupID: String, priority: MetadataRequestPriority) {
         guard let group = groupByID[groupID], !group.isMetadataLoaded else { return }
+        if group.isCameraBacked {
+            // A camera's metadata is not a background catalogue job. Only
+            // the photo currently under keyboard/click focus or open in the
+            // viewer may issue an explicit request. This keeps the delegate
+            // gate closed for every other camera item.
+            guard lastFocusedID == groupID || viewerGroupID == groupID else { return }
+            let token = currentScanToken
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                guard let self, self.currentScanToken == token else { return }
+                MetadataLoadingCoordinator.shared.enqueue(
+                    group: group,
+                    priority: priority,
+                    loader: { _ in await CameraMonitor.shared.requestMetadata(for: group) }
+                ) { [weak self] metadata in
+                    guard let self, self.currentScanToken == token else { return }
+                    self.updateCameraMetadata(metadata, for: groupID)
+                }
+            }
+            return
+        }
         MetadataLoadingCoordinator.shared.prioritize(groupID: groupID, priority: priority)
     }
 }

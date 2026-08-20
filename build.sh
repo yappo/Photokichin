@@ -19,6 +19,7 @@ swiftc \
   -framework SwiftUI \
   -framework AppKit \
   -framework ImageIO \
+  -framework ImageCaptureCore \
   -framework DiskArbitration \
   -framework UniformTypeIdentifiers \
   -lsqlite3 \

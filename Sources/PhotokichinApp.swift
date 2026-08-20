@@ -62,10 +62,14 @@ struct ContentView: View {
             LabelManagementView(model: model)
         }
         .alert("削除の確認", isPresented: $showingDeleteConfirmation) {
-            Button("ゴミ箱へ移動", role: .destructive) { model.deleteCandidatesFromCard() }
+            Button(model.sourceCamera == nil ? "ゴミ箱へ移動" : "カメラから削除", role: .destructive) {
+                model.deleteCandidatesAfterConfirmation()
+            }
             Button("キャンセル", role: .cancel) {}
         } message: {
-            Text("削除候補にしたJPGとCR3をmacOSのゴミ箱へ移動します。カメラ側の保護状態は判定できません。カード上のファイルは元に戻せる場合がありますが、実行前に確認してください。")
+            Text(model.sourceCamera == nil
+                ? "削除候補にしたJPGとCR3をmacOSのゴミ箱へ移動します。実行前に確認してください。"
+                : "削除候補にしたカメラ内のJPGとCR3をカメラから削除します。ゴミ箱には入らず、復元できない場合があります。実行前に確認してください。")
         }
         .alert("Photokichin", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("閉じる", role: .cancel) { model.errorMessage = nil }
@@ -113,6 +117,38 @@ private struct Sidebar: View {
                 }
                 Button("フォルダを選択…", systemImage: "folder") { model.chooseSourceFolder() }
                     .buttonStyle(.plain)
+            }
+
+            Section("USBカメラ") {
+                if model.cameras.isEmpty {
+                    Label("カメラが見つかりません", systemImage: "camera.badge.ellipsis")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.cameras) { camera in
+                        Button {
+                            model.scan(camera: camera)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Label(camera.name, systemImage: "camera")
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Text(camera.statusText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if model.sourceCamera?.id == camera.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(model.sourceCamera?.id == camera.id ? Color.accentColor : .primary)
+                        .disabled(!camera.isReady || model.isBusy)
+                    }
+                    Text("カメラを開くと写真一覧を準備します。準備中もアプリは操作できます。削除は確認してから実行します。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("ライブラリ") {
@@ -291,13 +327,17 @@ private struct BrowserDetail: View {
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 Button("更新", systemImage: "arrow.clockwise") {
-                    if let sourceURL = model.sourceURL { model.scan(url: sourceURL, volume: model.sourceVolume) }
+                    if let sourceCamera = model.sourceCamera {
+                        model.scan(camera: sourceCamera)
+                    } else if let sourceURL = model.sourceURL {
+                        model.scan(url: sourceURL, volume: model.sourceVolume)
+                    }
                 }
                 .disabled(model.sourceURL == nil || model.isBusy)
                 .help("現在の写真一覧を再読み込み")
 
                 Button("ソース", systemImage: "folder.badge.plus") { model.chooseSourceFolder() }
-                    .help("写真を表示するフォルダまたはSDカードを選択")
+                    .help("写真を表示するフォルダ、SDカード、またはUSBカメラを選択")
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
@@ -353,12 +393,17 @@ private struct BrowserDetail: View {
                 )
 
                 Button("ゴミ箱", systemImage: "trash") { showingDeleteConfirmation = true }
-                    .disabled(model.deleteCandidatePhotoCount == 0 || model.isBusy || model.sourceVolume == nil)
+                    .disabled(model.deleteCandidatePhotoCount == 0 || model.isBusy || !model.canDeleteSourceFiles)
                     .help("削除候補の写真をゴミ箱へ移動")
 
                 Button("Eject", systemImage: "eject") { model.ejectCurrentVolume() }
-                    .disabled(model.sourceVolume == nil || model.isBusy || model.isScanning)
-                    .help("SDカードを安全に取り出す")
+                    .disabled(
+                            (model.sourceVolume == nil && model.sourceCamera?.canEject != true)
+                            || model.isBusy
+                            || model.isScanning
+                            || model.isCameraCataloging
+                    )
+                    .help(model.sourceCamera == nil ? "SDカードを安全に取り出す" : "カメラを安全に取り出す")
 
                 Button {
                     model.inspectorShown.toggle()
@@ -375,7 +420,7 @@ private struct BrowserDetail: View {
                 .help("ライブラリのカタログを管理")
             }
         }
-        .navigationTitle(model.sourceURL?.lastPathComponent ?? "Photokichin")
+        .navigationTitle(model.sourceCamera?.name ?? model.sourceURL?.lastPathComponent ?? "Photokichin")
     }
 }
 
@@ -445,6 +490,8 @@ private struct PhotoGrid: View {
     private var photoContent: some View {
         if model.sourceURL == nil {
             EmptyStateView()
+        } else if model.isCameraCataloging && model.groups.isEmpty {
+            CameraCatalogLoadingView()
         } else if model.isScanning && model.groups.isEmpty && currentSourceSnapshot == nil {
             ProgressView("写真を探しています…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -462,7 +509,10 @@ private struct PhotoGrid: View {
                     )
                 }
 
-                if model.isScanning && model.groups.isEmpty {
+                if model.isCameraCataloging && model.groups.isEmpty {
+                    CameraCatalogLoadingView()
+                        .background(.background.opacity(0.75))
+                } else if model.isScanning && model.groups.isEmpty {
                     ProgressView("写真を探しています…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(.background.opacity(0.75))
@@ -511,14 +561,17 @@ private struct PhotoGrid: View {
             filteredGroups: [:]
         )
 
-        // A returning source keeps its complete list throughout the rescan.
-        // Publishing the scanner's small initial snapshot into an existing
-        // ScrollView would briefly shrink its content and irreversibly clamp
-        // the retained scroll offset. A source without a retained view still
-        // receives the initial snapshot for fast first display.
+        // A returning volume source keeps its complete list throughout a
+        // rescan so a small initial filesystem batch cannot clamp its saved
+        // scroll offset. Camera catalog snapshots are different: each
+        // accepted catalog is the requested replacement and must be published
+        // while the camera is still cataloging.
         let hasRetainedContent = existingSnapshot?.allGroups.isEmpty == false
-        let mayPublishCurrentGroups = !hasRetainedContent || !model.isScanning
-        if mayPublishCurrentGroups, !model.groups.isEmpty {
+        let isLiveCameraCatalogUpdate = model.isCameraSource && model.isCameraCataloging
+        let mayPublishCurrentGroups = isLiveCameraCatalogUpdate
+            || !hasRetainedContent
+            || !model.isScanning
+        if mayPublishCurrentGroups {
             snapshot.allGroups = model.groupedPhotos
             if model.hasActiveFilters {
                 snapshot.filteredGroups[filterKey] = model.filteredGroupedPhotos
@@ -847,7 +900,9 @@ private struct PhotoListView: View {
             group.id,
             group.jpegURL?.path ?? "",
             group.rawURL?.path ?? "",
-            group.movieURL?.path ?? ""
+            group.movieURL?.path ?? "",
+            group.cameraReference?.cameraID ?? "",
+            group.cameraReference?.groupKey ?? ""
         ].joined(separator: "|")
     }
 
@@ -982,14 +1037,38 @@ private struct PhotoListView: View {
             let priority: ThumbnailRequestPriority = visibleIDs.contains(rows[index].id) ? .visible : .prefetch
             return rows[index].photos.map { ($0, priority) }
         }
-        ThumbnailLoadingCoordinator.shared.updateListWorkingSet(
-            groups: thumbnailRequests,
-            maxPixel: min(640, max(320, Int(model.thumbnailSize * 2)))
-        ) { groupID, priority in
-            model.prioritizeMetadata(
-                for: groupID,
-                priority: priority == .visible ? .visible : .prefetch
+        let maxPixel = min(640, max(320, Int(model.thumbnailSize * 2)))
+        if model.isCameraSource {
+            ThumbnailLoadingCoordinator.shared.updateListWorkingSet(
+                groups: [],
+                maxPixel: maxPixel,
+                onThumbnailReady: { _, _ in }
             )
+            CameraThumbnailCoordinator.shared.updateListWorkingSet(
+                groups: thumbnailRequests,
+                maxPixel: maxPixel,
+                onThumbnailReady: { groupID, priority in
+                    model.prioritizeMetadata(
+                        for: groupID,
+                        priority: priority == .visible ? .visible : .prefetch
+                    )
+                }
+            )
+        } else {
+            CameraThumbnailCoordinator.shared.updateListWorkingSet(
+                groups: [],
+                maxPixel: maxPixel,
+                onThumbnailReady: { _, _ in }
+            )
+            ThumbnailLoadingCoordinator.shared.updateListWorkingSet(
+                groups: thumbnailRequests,
+                maxPixel: maxPixel
+            ) { groupID, priority in
+                model.prioritizeMetadata(
+                    for: groupID,
+                    priority: priority == .visible ? .visible : .prefetch
+                )
+            }
         }
     }
 
@@ -1114,7 +1193,7 @@ private struct PhotoImportClusterHeader: View {
             )
             Label(cluster.state.title, systemImage: cluster.state.systemImage)
                 .font(.callout.weight(.semibold))
-                .foregroundStyle(cluster.state == .partial ? .orange : .primary)
+                .foregroundStyle([.possible, .partial].contains(cluster.state) ? .orange : .primary)
             Text("\(cluster.photos.count)枚")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1203,7 +1282,7 @@ private struct SelectionSummaryBar: View {
                 .foregroundStyle(.secondary)
             if model.sourceURL != nil && !model.isLibraryView {
                 Menu {
-                    ForEach(PhotoImportFilter.allCases) { filter in
+                    ForEach(model.availableImportFilters) { filter in
                         Button {
                             model.importFilter = filter
                         } label: {
@@ -1335,7 +1414,7 @@ private struct DateSectionHeader: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(PhotoImportState.allCases.sorted { $0.sortOrder < $1.sortOrder }) { state in
-                            let count = photos.filter { $0.cardImportState == state }.count
+                            let count = photos.filter { $0.displayImportState == state }.count
                             if count > 0 {
                                 Text("\(state.title) \(count)")
                                     .font(.caption)
@@ -1381,7 +1460,7 @@ private struct DateSectionHeader: View {
                     Button("削除候補にする", systemImage: "trash") {
                         model.markDeleteCandidates(in: photos)
                     }
-                    .disabled(deleteCount == photos.count)
+                    .disabled(!model.canDeleteSourceFiles || deleteCount == photos.count)
                     Button("削除候補を解除", systemImage: "trash.slash") {
                         model.clearDeleteCandidates(in: photos)
                     }
@@ -1405,6 +1484,7 @@ private struct DateSectionHeader: View {
     private func color(for state: PhotoImportState) -> Color {
         switch state {
         case .notImported: return .secondary
+        case .possible: return .orange
         case .partial: return .orange
         case .imported: return .green
         case .notApplicable: return .gray
@@ -1468,9 +1548,17 @@ private struct PhotoGroupTile: View {
                     .padding(7)
             }
             .overlay(alignment: .topTrailing) {
-                if showImportStatus && group.cardImportState == .imported {
-                    ImportedStatusBadge(size: 18)
-                        .padding(8)
+                if showImportStatus {
+                    switch group.displayImportState {
+                    case .imported:
+                        ImportedStatusBadge(size: 18)
+                            .padding(8)
+                    case .possible:
+                        PossibleImportedStatusBadge(size: 18)
+                            .padding(8)
+                    default:
+                        EmptyView()
+                    }
                 }
             }
             .overlay(alignment: .bottomTrailing) {
@@ -1525,6 +1613,8 @@ private struct PhotoGroupTile: View {
             group.jpegURL?.path ?? "",
             group.rawURL?.path ?? "",
             group.movieURL?.path ?? "",
+            group.cameraReference?.cameraID ?? "",
+            group.cameraReference?.groupKey ?? "",
             String(loadingPriority?.rawValue ?? -1)
         ].joined(separator: "|")) {
             guard let loadingPriority else {
@@ -1582,15 +1672,39 @@ private struct ImportedStatusBadge: View {
     }
 }
 
+private struct PossibleImportedStatusBadge: View {
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.orange)
+            Image(systemName: "questionmark")
+                .font(.system(size: size * 0.55, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .frame(width: size, height: size)
+        .overlay {
+            Circle()
+                .stroke(Color.white.opacity(0.9), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.35), radius: 2)
+        .accessibilityLabel("取り込み済みかもしれない")
+        .help("取り込み済みかもしれない")
+    }
+}
+
 private struct PhotoVariantBadges: View {
     let group: PhotoGroup
 
     var body: some View {
+        let hasJPEG = group.variants.contains(.jpeg)
+        let hasRAW = group.variants.contains(.raw)
         HStack(spacing: 4) {
-            if group.jpegURL != nil { Badge(text: "JPG", color: .blue) }
-            if group.rawURL != nil { Badge(text: "RAW", color: .orange) }
+            if hasJPEG { Badge(text: "JPG", color: .blue) }
+            if hasRAW { Badge(text: "RAW", color: .orange) }
             if group.libraryAssetStatus == .unregistered || group.libraryAssetStatus == .partial {
-                if group.jpegURL != nil || group.rawURL != nil {
+                if hasJPEG || hasRAW {
                     Divider()
                         .frame(height: 14)
                         .padding(.horizontal, 3)
@@ -1628,9 +1742,25 @@ private struct EmptyStateView: View {
                 .foregroundStyle(.secondary)
             Text("写真を表示する場所を選択してください")
                 .font(.title3.weight(.semibold))
-            Text("EOS RのSDカードを接続するか、写真の入ったフォルダを選択します。")
+        Text("EOS RのSDカード、USBカメラ、または写真の入ったフォルダを選択します。")
                 .foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct CameraCatalogLoadingView: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            ProgressView()
+                .controlSize(.regular)
+            Text("カメラの写真一覧を準備しています")
+                .font(.title3.weight(.semibold))
+            Text("見つかった写真から順に表示します。写真の枚数が多い場合は、追加読み込み中も操作できます。")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -1663,8 +1793,15 @@ private struct InspectorView: View {
                 if let group {
                     Text(group.basename).font(.subheadline.weight(.semibold)).textSelection(.enabled)
                     HStack(spacing: 7) {
-                        if !model.isLibraryView && group.cardImportState == .imported {
-                            ImportedStatusBadge(size: 18)
+                        if !model.isLibraryView {
+                            switch group.displayImportState {
+                            case .imported:
+                                ImportedStatusBadge(size: 18)
+                            case .possible:
+                                PossibleImportedStatusBadge(size: 18)
+                            default:
+                                EmptyView()
+                            }
                         }
                         PhotoVariantBadges(group: group)
                     }
@@ -1705,6 +1842,7 @@ private struct InspectorView: View {
                                 .frame(width: 42, height: 36)
                         }
                         .buttonStyle(.plain)
+                        .disabled(!model.canDeleteSourceFiles)
                         .help("削除候補を切り替え（Delete）")
                     }
                     .padding(.vertical, 2)
@@ -2291,18 +2429,20 @@ private struct ImportSheet: View {
 
     private var selectedFileCount: Int {
         model.selectedGroups.reduce(0) { count, group in
-            count + [group.jpegURL, group.rawURL].compactMap { $0 }.count
+            count + group.importableVariants.count
         }
     }
 
     private var sourceName: String {
-        model.sourceVolume?.name
+        model.sourceCamera?.name
+            ?? model.sourceVolume?.name
             ?? model.sourceURL?.lastPathComponent
             ?? "選択元未設定"
     }
 
     private var sourceIcon: String {
         if isLibraryCopy { return "internaldrive" }
+        if model.sourceCamera != nil { return "camera" }
         return model.sourceVolume == nil ? "folder" : "sdcard"
     }
 
@@ -2394,14 +2534,24 @@ private struct ViewerSheet: View {
                 model.prioritizeMetadata(for: neighbor.id, priority: .viewerNeighbor)
             }
             loader.load(for: group, maxPixel: 3200, priority: .viewerCurrent)
-            ThumbnailLoadingCoordinator.shared.updateViewerPrefetch(
-                groups: model.viewerNeighborGroups,
-                maxPixel: 2400
-            )
+            if model.isCameraSource {
+                ThumbnailLoadingCoordinator.shared.clearViewerPrefetch()
+                CameraThumbnailCoordinator.shared.updateViewerPrefetch(
+                    groups: model.viewerNeighborGroups,
+                    maxPixel: 2400
+                )
+            } else {
+                CameraThumbnailCoordinator.shared.clearViewerPrefetch()
+                ThumbnailLoadingCoordinator.shared.updateViewerPrefetch(
+                    groups: model.viewerNeighborGroups,
+                    maxPixel: 2400
+                )
+            }
         }
         .onDisappear {
             loader.cancel()
             ThumbnailLoadingCoordinator.shared.clearViewerPrefetch()
+            CameraThumbnailCoordinator.shared.clearViewerPrefetch()
         }
         .onExitCommand { model.closeViewer() }
     }
@@ -2414,8 +2564,15 @@ private struct ViewerMetadataBar: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 9) {
-                if showImportStatus && group.cardImportState == .imported {
-                    ImportedStatusBadge(size: 18)
+                if showImportStatus {
+                    switch group.displayImportState {
+                    case .imported:
+                        ImportedStatusBadge(size: 18)
+                    case .possible:
+                        PossibleImportedStatusBadge(size: 18)
+                    default:
+                        EmptyView()
+                    }
                 }
                 PhotoVariantBadges(group: group)
                 Divider()

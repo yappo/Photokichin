@@ -5,7 +5,9 @@ import CryptoKit
 struct PhotokichinTestRunner {
     static func main() throws {
         try runImportStateTests()
+        try runCameraModelTests()
         try runCatalogTests()
+        try runFilenameIdentityTests()
         try runSourceIdentityTests()
         try runLibraryCopyTests()
         try runLabelTests()
@@ -74,6 +76,18 @@ struct PhotokichinTestRunner {
         let pending = makeGroup(root: root, jpeg: true, raw: true, importedJPEG: false, importedRAW: false)
         try require(pending.cardImportState == .notImported, "an unimported JPG＋CR3 pair must be未取り込み")
 
+        var possible = makeGroup(root: root, jpeg: true, raw: true, importedJPEG: false, importedRAW: false)
+        possible.possibleImportedJPEG = true
+        try require(possible.displayImportState == .possible, "a metadata-only camera match must be取り込み済みかもしれない")
+        try require(
+            possible.matches(importFilter: .possible, operationFilter: .all, selected: false, deleteCandidate: false),
+            "the possible import filter must include metadata-only matches"
+        )
+        try require(
+            !possible.matches(importFilter: .notImported, operationFilter: .all, selected: false, deleteCandidate: false),
+            "a possible import must not be shown as未取り込み"
+        )
+
         let rawOnlyImported = makeGroup(root: root, jpeg: true, raw: true, importedJPEG: false, importedRAW: true)
         try require(rawOnlyImported.cardImportState == .partial, "CR3 imported and JPG unimported must be一部")
 
@@ -138,6 +152,120 @@ struct PhotokichinTestRunner {
         print("PASS: stable ordering, date-boundary navigation, page navigation, and filters")
     }
 
+    private static func runCameraModelTests() throws {
+        let cameraMetadata = ImageIOReader.readMetadata(properties: [
+            "{Exif}": [
+                "LensModel": "RF24-70mm F2.8 L IS USM",
+                "FocalLength": 50.0,
+                "FNumber": 2.8,
+                "ExposureTime": 0.008,
+                "ISOSpeedRatings": 800,
+                "ExposureBiasValue": 0.0
+            ],
+            "{TIFF}": [
+                "Make": "Canon",
+                "Model": "Canon EOS R5m2"
+            ]
+        ])
+        try require(cameraMetadata?.lensModel == "RF24-70mm F2.8 L IS USM", "camera metadata parser must expose the lens")
+        try require(cameraMetadata?.aperture != nil, "camera metadata parser must expose the aperture")
+        try require(cameraMetadata?.shutterSpeed != nil, "camera metadata parser must expose the shutter speed")
+        try require(cameraMetadata?.iso != nil, "camera metadata parser must expose ISO")
+
+        let reference = CameraPhotoReference(
+            cameraID: "camera-test",
+            groupKey: "DCIM/100EOS_R/IMG_0001",
+            assets: [
+                CameraAssetReference(
+                    identifier: "handle:1",
+                    filename: "IMG_0001.JPG",
+                    variant: .jpeg,
+                    fileSize: 10,
+                    captureDate: Date(timeIntervalSince1970: 0)
+                ),
+                CameraAssetReference(
+                    identifier: "handle:2",
+                    filename: "IMG_0001.CR3",
+                    variant: .raw,
+                    fileSize: 20,
+                    captureDate: Date(timeIntervalSince1970: 0)
+                )
+            ]
+        )
+        let group = PhotoGroup(
+            id: "camera:camera-test:DCIM/100EOS_R/IMG_0001",
+            basename: "IMG_0001",
+            directory: URL(fileURLWithPath: "/__photokichin_camera__"),
+            jpegURL: nil,
+            rawURL: nil,
+            movieURL: nil,
+            captureDate: Date(timeIntervalSince1970: 0),
+            metadata: .empty,
+            importedJPEG: false,
+            importedRAW: false,
+            isMetadataLoaded: true,
+            cameraReference: reference
+        )
+        try require(group.isCameraBacked, "camera groups must retain a remote source reference")
+        try require(group.variants == [.jpeg, .raw], "camera groups must expose their remote JPG/CR3 variants")
+        try require(group.importableVariants == [.jpeg, .raw], "camera JPG/CR3 variants must be importable")
+        try require(group.cardImportState == .notImported, "an unimported camera JPG+CR3 pair must be未取り込み")
+
+        let jpegOnly = PhotoGroup(
+            id: "camera:camera-test:DCIM/100EOS_R/IMG_0002",
+            basename: "IMG_0002",
+            directory: URL(fileURLWithPath: "/__photokichin_camera__"),
+            jpegURL: nil,
+            rawURL: nil,
+            movieURL: nil,
+            captureDate: Date(timeIntervalSince1970: 0),
+            metadata: .empty,
+            importedJPEG: false,
+            importedRAW: false,
+            isMetadataLoaded: true,
+            cameraReference: CameraPhotoReference(
+                cameraID: "camera-test",
+                groupKey: "DCIM/100EOS_R/IMG_0002",
+                assets: [CameraAssetReference(
+                    identifier: "handle:3",
+                    filename: "IMG_0002.JPG",
+                    variant: .jpeg,
+                    fileSize: 30,
+                    captureDate: Date(timeIntervalSince1970: 0)
+                )]
+            )
+        )
+        try require(jpegOnly.variants == [.jpeg], "a camera JPG-only photo must not gain a synthetic CR3")
+        try require(jpegOnly.importableVariants == [.jpeg], "a camera JPG-only photo must import only its JPG")
+
+        let rawOnly = PhotoGroup(
+            id: "camera:camera-test:DCIM/100EOS_R/IMG_0003",
+            basename: "IMG_0003",
+            directory: URL(fileURLWithPath: "/__photokichin_camera__"),
+            jpegURL: nil,
+            rawURL: nil,
+            movieURL: nil,
+            captureDate: Date(timeIntervalSince1970: 0),
+            metadata: .empty,
+            importedJPEG: false,
+            importedRAW: false,
+            isMetadataLoaded: true,
+            cameraReference: CameraPhotoReference(
+                cameraID: "camera-test",
+                groupKey: "DCIM/100EOS_R/IMG_0003",
+                assets: [CameraAssetReference(
+                    identifier: "handle:4",
+                    filename: "IMG_0003.CR3",
+                    variant: .raw,
+                    fileSize: 40,
+                    captureDate: Date(timeIntervalSince1970: 0)
+                )]
+            )
+        )
+        try require(rawOnly.variants == [.raw], "a camera RAW-only photo must not gain a synthetic JPG")
+        try require(rawOnly.importableVariants == [.raw], "a camera RAW-only photo must import only its CR3")
+    }
+
     private static func runLibraryAirDropTests() throws {
         let libraryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("Photokichin-library-airdrop-\(UUID().uuidString)", isDirectory: true)
@@ -167,7 +295,9 @@ struct PhotokichinTestRunner {
         jpeg: Bool,
         raw: Bool,
         importedJPEG: Bool,
-        importedRAW: Bool
+        importedRAW: Bool,
+        possibleImportedJPEG: Bool = false,
+        possibleImportedRAW: Bool = false
     ) -> PhotoGroup {
         PhotoGroup(
             id: UUID().uuidString,
@@ -180,7 +310,9 @@ struct PhotokichinTestRunner {
             metadata: .empty,
             importedJPEG: importedJPEG,
             importedRAW: importedRAW,
-            isMetadataLoaded: true
+            isMetadataLoaded: true,
+            possibleImportedJPEG: possibleImportedJPEG,
+            possibleImportedRAW: possibleImportedRAW
         )
     }
 
@@ -224,6 +356,71 @@ struct PhotokichinTestRunner {
         try require(store.integrityReport() == "ok", "catalog integrity check failed")
 
         print("PASS: catalog migration, unregistered detection, candidate relink, backup, and integrity check")
+    }
+
+    private static func runFilenameIdentityTests() throws {
+        try require(FilenameIdentity.key(for: "IMG_0001.JPG") == "img_0001.jpg", "filename key should be case-insensitive while retaining the extension")
+        try require(FilenameIdentity.key(for: "フォルダ/写真.JPG") == "写真.jpg", "filename key should use only the basename")
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-filename-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let imported = root.appendingPathComponent("imported/IMG_0001.JPG")
+        let library = root.appendingPathComponent("library/IMG_0001.JPG")
+        try FileManager.default.createDirectory(at: imported.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: library.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let contents = Data("same-camera-content".utf8)
+        try contents.write(to: imported)
+        try contents.write(to: library)
+
+        let store = try CatalogStore(libraryRoot: root)
+        let digest = try hash(imported)
+        try store.recordImport(
+            sourceKey: "camera:test:IMG_0001:JPG",
+            variant: .jpeg,
+            destinationURL: imported,
+            sha256: digest,
+            sourceFilename: "IMG_0001.JPG"
+        )
+        try store.recordLibraryAsset(
+            url: library,
+            variant: .jpeg,
+            sha256: digest,
+            fileSize: Int64(contents.count)
+        )
+
+        let candidates = store.matchCandidates(sourceFilenameKey: "img_0001.jpg", fileSize: Int64(contents.count), variant: .jpeg)
+        try require(candidates.count == 2, "metadata-only candidate lookup should include imported and library records")
+        try require(candidates.allSatisfy { $0.filenameKey == "img_0001.jpg" }, "candidate lookup should retain normalized filename keys")
+        try require(
+            store.matchCandidates(sourceFilenameKey: "other.jpg", fileSize: Int64(contents.count), variant: .jpeg).isEmpty,
+            "candidate lookup must use the normalized filename key as well as size and variant"
+        )
+        try require(
+            store.existingContentDestination(sha256: digest, variant: .jpeg, fileSize: Int64(contents.count)) != nil,
+            "a verified camera hash should find an existing library destination"
+        )
+        try require(
+            store.existingContentDestination(sha256: digest, variant: .raw, fileSize: Int64(contents.count)) == nil,
+            "a matching hash with another variant must not be reused"
+        )
+        let partial = root.appendingPathComponent("camera/.photokichin-partial-test")
+        let cameraDestination = root.appendingPathComponent("camera/IMG_0001.JPG")
+        try FileManager.default.createDirectory(at: cameraDestination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try contents.write(to: partial)
+        let installed = try FileTransferService.shared.installCameraDownloadedFile(
+            partialURL: partial,
+            destinationURL: cameraDestination,
+            variant: .jpeg,
+            sourceKey: "camera:test:IMG_0001:JPG",
+            sourceFilename: "IMG_0001.JPG",
+            catalog: store,
+            expectedFileSize: Int64(contents.count),
+            cancellation: nil
+        )
+        try require(!installed, "camera import should reuse the verified existing file")
+        try require(!FileManager.default.fileExists(atPath: cameraDestination.path), "camera reuse must not create a duplicate destination file")
+        print("PASS: source filename keys, metadata-only candidates, and verified cross-source reuse")
     }
 
     private static func runSourceIdentityTests() throws {

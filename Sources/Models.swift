@@ -32,8 +32,30 @@ enum AssetVariant: String, CaseIterable, Codable, Sendable {
     case movie = "動画"
 }
 
+/// A reference to a file exposed by ImageCaptureCore. The framework objects
+/// themselves are deliberately kept out of PhotoGroup because they are not
+/// Sendable and cannot be used safely by the scanner or transfer workers.
+struct CameraAssetReference: Hashable, Sendable {
+    let identifier: String
+    let filename: String
+    let variant: AssetVariant
+    let fileSize: Int64
+    let captureDate: Date?
+}
+
+struct CameraPhotoReference: Hashable, Sendable {
+    let cameraID: String
+    let groupKey: String
+    let assets: [CameraAssetReference]
+
+    func asset(for variant: AssetVariant) -> CameraAssetReference? {
+        assets.first { $0.variant == variant }
+    }
+}
+
 enum PhotoImportState: String, CaseIterable, Hashable, Identifiable, Sendable {
     case notImported
+    case possible
     case partial
     case imported
     case notApplicable
@@ -43,6 +65,7 @@ enum PhotoImportState: String, CaseIterable, Hashable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .notImported: return "未取り込み"
+        case .possible: return "取り込み済みかもしれない"
         case .partial: return "一部"
         case .imported: return "取り込み済み"
         case .notApplicable: return "対象外"
@@ -52,6 +75,7 @@ enum PhotoImportState: String, CaseIterable, Hashable, Identifiable, Sendable {
     var systemImage: String {
         switch self {
         case .notImported: return "arrow.down.circle"
+        case .possible: return "questionmark.circle"
         case .partial: return "circle.lefthalf.filled"
         case .imported: return "checkmark.circle"
         case .notApplicable: return "minus.circle"
@@ -61,9 +85,10 @@ enum PhotoImportState: String, CaseIterable, Hashable, Identifiable, Sendable {
     var sortOrder: Int {
         switch self {
         case .notImported: return 0
-        case .partial: return 1
-        case .imported: return 2
-        case .notApplicable: return 3
+        case .possible: return 1
+        case .partial: return 2
+        case .imported: return 3
+        case .notApplicable: return 4
         }
     }
 }
@@ -71,6 +96,7 @@ enum PhotoImportState: String, CaseIterable, Hashable, Identifiable, Sendable {
 enum PhotoImportFilter: CaseIterable, Hashable, Identifiable, Sendable {
     case all
     case notImported
+    case possible
     case partial
     case imported
     case notApplicable
@@ -81,6 +107,7 @@ enum PhotoImportFilter: CaseIterable, Hashable, Identifiable, Sendable {
         switch self {
         case .all: return "すべて"
         case .notImported: return PhotoImportState.notImported.title
+        case .possible: return PhotoImportState.possible.title
         case .partial: return PhotoImportState.partial.title
         case .imported: return PhotoImportState.imported.title
         case .notApplicable: return PhotoImportState.notApplicable.title
@@ -91,6 +118,7 @@ enum PhotoImportFilter: CaseIterable, Hashable, Identifiable, Sendable {
         switch self {
         case .all: return "photo.on.rectangle"
         case .notImported: return PhotoImportState.notImported.systemImage
+        case .possible: return PhotoImportState.possible.systemImage
         case .partial: return PhotoImportState.partial.systemImage
         case .imported: return PhotoImportState.imported.systemImage
         case .notApplicable: return PhotoImportState.notApplicable.systemImage
@@ -101,6 +129,7 @@ enum PhotoImportFilter: CaseIterable, Hashable, Identifiable, Sendable {
         switch self {
         case .all: return nil
         case .notImported: return .notImported
+        case .possible: return .possible
         case .partial: return .partial
         case .imported: return .imported
         case .notApplicable: return .notApplicable
@@ -216,12 +245,21 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
     var metadata: PhotoMetadata
     var importedJPEG: Bool
     var importedRAW: Bool
+    /// A metadata-only catalog match. This is deliberately separate from
+    /// importedJPEG/importedRAW because filename, size, and variant do not
+    /// prove that two files have identical bytes.
+    var possibleImportedJPEG: Bool
+    var possibleImportedRAW: Bool
     var isMetadataLoaded: Bool
     var libraryAssetStatus: LibraryAssetStatus = .notApplicable
     /// Persistent catalog identity. Unlike `id`, this value survives a
     /// Finder move and may be shared by an explicit library-to-library copy.
     var photoID: String?
     var labels: [PhotoLabel]
+    /// Non-filesystem assets reported by a USB camera through
+    /// ImageCaptureCore. The live ICCameraFile objects are owned by
+    /// CameraMonitor and looked up by the identifiers in this value.
+    var cameraReference: CameraPhotoReference?
     /// Stable order assigned by the lightweight directory scan. Detailed
     /// metadata may update captureDate later, but must not move an already
     /// visible photo within its day.
@@ -239,9 +277,12 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
         importedJPEG: Bool,
         importedRAW: Bool,
         isMetadataLoaded: Bool,
+        possibleImportedJPEG: Bool = false,
+        possibleImportedRAW: Bool = false,
         libraryAssetStatus: LibraryAssetStatus = .notApplicable,
         photoID: String? = nil,
         labels: [PhotoLabel] = [],
+        cameraReference: CameraPhotoReference? = nil,
         presentationOrder: Int = 0
     ) {
         self.id = id
@@ -254,10 +295,13 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
         self.metadata = metadata
         self.importedJPEG = importedJPEG
         self.importedRAW = importedRAW
+        self.possibleImportedJPEG = possibleImportedJPEG
+        self.possibleImportedRAW = possibleImportedRAW
         self.isMetadataLoaded = isMetadataLoaded
         self.libraryAssetStatus = libraryAssetStatus
         self.photoID = photoID
         self.labels = labels
+        self.cameraReference = cameraReference
         self.presentationOrder = presentationOrder
     }
 
@@ -275,6 +319,8 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
 
     var primaryURL: URL? { jpegURL ?? rawURL ?? movieURL }
 
+    var isCameraBacked: Bool { cameraReference != nil }
+
     func url(for variant: AssetVariant) -> URL? {
         switch variant {
         case .jpeg: return jpegURL
@@ -288,7 +334,16 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
         if jpegURL != nil { result.append(.jpeg) }
         if rawURL != nil { result.append(.raw) }
         if movieURL != nil { result.append(.movie) }
+        if let cameraReference {
+            for variant in AssetVariant.allCases where cameraReference.asset(for: variant) != nil {
+                if !result.contains(variant) { result.append(variant) }
+            }
+        }
         return result
+    }
+
+    var importableVariants: [AssetVariant] {
+        variants.filter { $0 == .jpeg || $0 == .raw }
     }
 
     var dateKey: String {
@@ -297,20 +352,41 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
     }
 
     var cardImportState: PhotoImportState {
-        let available = [jpegURL, rawURL].compactMap { $0 }.count
+        let available = importableVariants.count
         guard available > 0 else { return .notApplicable }
 
-        let imported = [
-            jpegURL != nil && importedJPEG,
-            rawURL != nil && importedRAW
-        ].filter { $0 }.count
+        let imported = importableVariants.filter { variant in
+            switch variant {
+            case .jpeg: return importedJPEG
+            case .raw: return importedRAW
+            case .movie: return false
+            }
+        }.count
         if imported == 0 { return .notImported }
         if imported == available { return .imported }
         return .partial
     }
 
+    var hasPossibleImport: Bool {
+        importableVariants.contains { variant in
+            switch variant {
+            case .jpeg: return !importedJPEG && possibleImportedJPEG
+            case .raw: return !importedRAW && possibleImportedRAW
+            case .movie: return false
+            }
+        }
+    }
+
+    /// The visible/filterable state. Exact import state remains unchanged for
+    /// SD cards and library files; only a camera candidate adds .possible.
+    var displayImportState: PhotoImportState {
+        let exactState = cardImportState
+        guard exactState != .imported, hasPossibleImport else { return exactState }
+        return .possible
+    }
+
     func matches(importFilter: PhotoImportFilter, operationFilter: PhotoOperationFilter, selected: Bool, deleteCandidate: Bool) -> Bool {
-        let importMatches = importFilter.state.map { cardImportState == $0 } ?? true
+        let importMatches = importFilter.state.map { displayImportState == $0 } ?? true
         let operationMatches: Bool
         switch operationFilter {
         case .all: operationMatches = true
@@ -327,7 +403,7 @@ struct PhotoGroup: Identifiable, Hashable, Sendable {
         case .unregistered: return "EXT"
         case .notApplicable: break
         }
-        return cardImportState.title
+        return displayImportState.title
     }
 }
 
@@ -347,11 +423,11 @@ struct PhotoImportCluster: Identifiable, Hashable, Sendable {
     static func preservingOrder(dateKey: String, photos: [PhotoGroup]) -> [PhotoImportCluster] {
         guard let first = photos.first else { return [] }
         var result: [PhotoImportCluster] = []
-        var state = first.cardImportState
+        var state = first.displayImportState
         var run: [PhotoGroup] = []
 
         for photo in photos {
-            let nextState = photo.cardImportState
+            let nextState = photo.displayImportState
             if nextState != state {
                 result.append(PhotoImportCluster(dateKey: dateKey, state: state, photos: run))
                 run.removeAll(keepingCapacity: true)

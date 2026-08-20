@@ -171,6 +171,85 @@ final class FileTransferService {
         return ImportResult(groupID: group.id, message: message, copiedCount: copied, skippedCount: skipped, failedCount: failed)
     }
 
+    /// Verifies and installs a camera download that was written directly into
+    /// the destination library directory under a hidden partial filename.
+    /// Moving within that directory avoids a second full-file copy. This is
+    /// intentionally separate from the removable-volume import path.
+    func installCameraDownloadedFile(
+        partialURL: URL,
+        destinationURL: URL,
+        variant: AssetVariant,
+        sourceKey: String,
+        sourceFilename: String?,
+        catalog: CatalogStore,
+        expectedFileSize: Int64,
+        cancellation: ImportCancellationToken?
+    ) throws -> Bool {
+        try cancellation?.check()
+        guard FileManager.default.fileExists(atPath: partialURL.path) else {
+            throw AppError.transferFailed(partialURL, NSError(
+                domain: "Photokichin.Camera",
+                code: 40,
+                userInfo: [NSLocalizedDescriptionKey: "カメラからダウンロードした一時ファイルが見つかりません"]
+            ))
+        }
+        guard try fileSize(partialURL) == expectedFileSize else {
+            throw AppError.transferFailed(partialURL, NSError(
+                domain: "Photokichin.Camera",
+                code: 41,
+                userInfo: [NSLocalizedDescriptionKey: "カメラからのダウンロードサイズを検証できません"]
+            ))
+        }
+
+        let partialHash = try sha256(partialURL, cancellation: cancellation)
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            guard try fileSize(destinationURL) == expectedFileSize,
+                  try sha256(destinationURL, cancellation: cancellation) == partialHash else {
+                throw AppError.copyConflict(destinationURL)
+            }
+            try FileManager.default.removeItem(at: partialURL)
+            try catalog.recordImports([CatalogImportRecord(
+                sourceKey: sourceKey,
+                variant: variant,
+                destinationURL: destinationURL,
+                sha256: partialHash,
+                fileSize: expectedFileSize,
+                sourceFilename: sourceFilename
+            )])
+            return false
+        }
+
+        if let existingURL = catalog.existingContentDestination(
+            sha256: partialHash,
+            variant: variant,
+            fileSize: expectedFileSize
+        ) {
+            try cancellation?.check()
+            try FileManager.default.removeItem(at: partialURL)
+            try catalog.recordImports([CatalogImportRecord(
+                sourceKey: sourceKey,
+                variant: variant,
+                destinationURL: existingURL,
+                sha256: partialHash,
+                fileSize: expectedFileSize,
+                sourceFilename: sourceFilename
+            )])
+            return false
+        }
+
+        try cancellation?.check()
+        try FileManager.default.moveItem(at: partialURL, to: destinationURL)
+        try catalog.recordImports([CatalogImportRecord(
+            sourceKey: sourceKey,
+            variant: variant,
+            destinationURL: destinationURL,
+            sha256: partialHash,
+            fileSize: expectedFileSize,
+            sourceFilename: sourceFilename
+        )])
+        return true
+    }
+
     func copyLibraryGroup(
         _ group: PhotoGroup,
         from sourceLibrary: URL,
@@ -431,6 +510,7 @@ final class FileTransferService {
             destinationURL: destinationURL,
             sha256: sha256,
             fileSize: fileSize,
+            sourceFilename: FilenameIdentity.rawFilename(for: sourceURL),
             legacySourceKey: newKey == legacyKey ? nil : legacyKey,
             sourceVolumeUUID: components?.volumeUUID,
             sourceRelativePath: components?.relativePath
