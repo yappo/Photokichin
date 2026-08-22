@@ -25,8 +25,19 @@ final class ImportCancellationToken: @unchecked Sendable {
 }
 
 final class FileTransferService {
+    typealias CopyFileOperation = @Sendable (
+        URL,
+        URL,
+        ImportCancellationToken?,
+        Bool
+    ) throws -> Bool
+
     static let shared = FileTransferService()
-    private init() {}
+    private let copyFileOperation: CopyFileOperation?
+
+    init(copyFileOperation: CopyFileOperation? = nil) {
+        self.copyFileOperation = copyFileOperation
+    }
 
     final class AirDropSession: NSObject, NSSharingServiceDelegate {
         let service: NSSharingService
@@ -556,6 +567,9 @@ final class FileTransferService {
         cancellation: ImportCancellationToken?,
         preferClone: Bool = false
     ) throws -> Bool {
+        if let copyFileOperation {
+            return try copyFileOperation(sourceURL, destinationURL, cancellation, preferClone)
+        }
         try cancellation?.check()
         let state = copyfile_state_alloc()
         guard let state else {

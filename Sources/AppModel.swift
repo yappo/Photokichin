@@ -137,8 +137,9 @@ final class AppModel: ObservableObject {
     @Published var isLabelManagementPresented = false
     @Published var copyLabelsOnLibraryCopy = true
 
-    let volumeMonitor = VolumeMonitor()
-    let cameraMonitor = CameraMonitor.shared
+    let volumeMonitor: any VolumeMonitoring
+    let cameraMonitor: any CameraMonitoring
+    private let userDefaults: UserDefaults
     private var catalog: CatalogStore?
     private var targetCatalog: CatalogStore?
     private var groupByID: [String: PhotoGroup] = [:]
@@ -174,8 +175,18 @@ final class AppModel: ObservableObject {
     weak var photoSelectionResponder: NSView?
     private var photoIDsByLabelID: [String: Set<String>] = [:]
 
-    init() {
-        let defaults = UserDefaults.standard
+    init(
+        volumeMonitor: (any VolumeMonitoring)? = nil,
+        cameraMonitor: (any CameraMonitoring)? = nil,
+        userDefaults: UserDefaults = .standard
+    ) {
+        self.volumeMonitor = volumeMonitor ?? VolumeMonitor()
+        self.cameraMonitor = cameraMonitor ?? CameraMonitor.shared
+        self.userDefaults = userDefaults
+        let volumeMonitor = self.volumeMonitor
+        let cameraMonitor = self.cameraMonitor
+
+        let defaults = userDefaults
         var savedLibraryPaths = defaults.stringArray(forKey: "libraryURLs") ?? []
         if let legacyPath = defaults.string(forKey: "libraryURL"),
            !savedLibraryPaths.contains(legacyPath) {
@@ -246,6 +257,27 @@ final class AppModel: ObservableObject {
         catalogInspectionWorkerTask?.cancel()
         catalogVerificationWorkerTask?.cancel()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+    }
+
+    /// Waits until the source scan and import operations owned by this model
+    /// have finished. Callers can use this when a complete state is required
+    /// before continuing, without assuming how long file operations take.
+    func waitUntilIdle() async {
+        while true {
+            let currentScan = scanTask
+            let currentImport = importTask
+            if currentScan == nil, currentImport == nil { return }
+            if let currentScan { await currentScan.value }
+            if let currentImport { await currentImport.value }
+            await Task.yield()
+        }
+    }
+
+    /// Replaces the current photo list and updates every collection derived
+    /// from it as one state change.
+    func replaceGroups(_ groups: [PhotoGroup]) {
+        self.groups = groups
+        rebuildGroupedPhotos()
     }
 
     var selectedGroups: [PhotoGroup] {
@@ -1028,8 +1060,7 @@ final class AppModel: ObservableObject {
         progressText = cameraGroups.isEmpty
             ? "USBカメラの写真一覧を準備しています…"
             : String(cameraGroups.count) + "組を表示中・追加読み込み中"
-        groups = cameraGroups
-        rebuildGroupedPhotos()
+        replaceGroups(cameraGroups)
         if !cameraGroups.isEmpty {
             focusFirstVisiblePhoto()
         }
@@ -1061,8 +1092,7 @@ final class AppModel: ObservableObject {
 
         scanTask?.cancel()
         scanTask = nil
-        self.groups = groups
-        rebuildGroupedPhotos()
+        replaceGroups(groups)
         if let importCatalog = targetCatalog {
             scheduleImportStateEnrichment(
                 groups: groups,
@@ -1241,11 +1271,11 @@ final class AppModel: ObservableObject {
     }
 
     private func persistLibrarySelection() {
-        UserDefaults.standard.set(libraryURLs.map(\.path), forKey: "libraryURLs")
+        userDefaults.set(libraryURLs.map(\.path), forKey: "libraryURLs")
         if let libraryURL {
-            UserDefaults.standard.set(libraryURL.path, forKey: "libraryURL")
+            userDefaults.set(libraryURL.path, forKey: "libraryURL")
         } else {
-            UserDefaults.standard.removeObject(forKey: "libraryURL")
+            userDefaults.removeObject(forKey: "libraryURL")
         }
     }
 
@@ -1254,7 +1284,7 @@ final class AppModel: ObservableObject {
         if !libraryURLs.contains(where: { $0.standardizedFileURL == normalizedURL }) {
             libraryURLs.append(normalizedURL)
         }
-        UserDefaults.standard.set(libraryURLs.map(\.path), forKey: "libraryURLs")
+        userDefaults.set(libraryURLs.map(\.path), forKey: "libraryURLs")
         return normalizedURL
     }
 
@@ -2918,7 +2948,7 @@ final class AppModel: ObservableObject {
                 MetadataLoadingCoordinator.shared.enqueue(
                     group: group,
                     priority: priority,
-                    loader: { _ in await CameraMonitor.shared.requestMetadata(for: group) }
+                    loader: { [cameraMonitor] _ in await cameraMonitor.requestMetadata(for: group) }
                 ) { [weak self] metadata in
                     guard let self, self.currentScanToken == token else { return }
                     self.updateCameraMetadata(metadata, for: groupID)

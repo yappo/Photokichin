@@ -46,7 +46,11 @@ final class ThumbnailCache {
 
 @MainActor
 final class ThumbnailLoadingCoordinator {
+    typealias DataLoader = @Sendable (URL, Int) async -> Data?
+
     static let shared = ThumbnailLoadingCoordinator()
+    private let cache: ThumbnailCache
+    private let dataLoader: DataLoader
 
     private final class Request {
         let id = UUID()
@@ -86,6 +90,16 @@ final class ThumbnailLoadingCoordinator {
     private var activeSourceRootPath: String?
     private var quiescing = false
 
+    init(
+        cache: ThumbnailCache? = nil,
+        dataLoader: @escaping DataLoader = { url, maxPixel in
+            ImageIOReader.thumbnailData(url: url, maxPixel: maxPixel)
+        }
+    ) {
+        self.cache = cache ?? .shared
+        self.dataLoader = dataLoader
+    }
+
     @discardableResult
     func subscribe(
         group: PhotoGroup,
@@ -106,7 +120,7 @@ final class ThumbnailLoadingCoordinator {
 
         let key = ThumbnailKey(path: url.path, maxPixel: maxPixel)
         let observationID = UUID()
-        if let image = ThumbnailCache.shared.image(for: url, maxPixel: maxPixel) {
+        if let image = cache.image(for: url, maxPixel: maxPixel) {
             onImage(image)
             return nil
         }
@@ -306,8 +320,11 @@ final class ThumbnailLoadingCoordinator {
             guard !request.observers.isEmpty else { continue }
             active[request.key] = request
 
+            let dataLoader = self.dataLoader
+            let url = request.url
+            let maxPixel = request.key.maxPixel
             let task = Task.detached(priority: .utility) {
-                ImageIOReader.thumbnailData(url: request.url, maxPixel: request.key.maxPixel)
+                await dataLoader(url, maxPixel)
             }
             request.task = task
             let requestID = request.id
@@ -338,7 +355,7 @@ final class ThumbnailLoadingCoordinator {
         var image: NSImage?
         if let data, let decoded = NSImage(data: data) {
             image = decoded
-            ThumbnailCache.shared.store(decoded, for: request.url, maxPixel: request.key.maxPixel)
+            cache.store(decoded, for: request.url, maxPixel: request.key.maxPixel)
         }
         let callbacks = Array(request.observers.values)
         for callback in callbacks {

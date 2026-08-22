@@ -1,21 +1,31 @@
 import Foundation
 import CryptoKit
+@testable import PhotokichinCore
 
 @main
 struct PhotokichinTestRunner {
-    static func main() throws {
-        try runImportStateTests()
-        try runCameraModelTests()
-        try runCatalogTests()
-        try runFilenameIdentityTests()
-        try runSourceIdentityTests()
-        try runLibraryCopyTests()
-        try runLabelTests()
-        try runLibraryAirDropTests()
+    static func main() async throws {
+        for module in PhotokichinTestModules.all {
+            try await module.run()
+        }
+        guard ProcessInfo.processInfo.environment["PHOTOKICHIN_RUN_HARDWARE_TESTS"] == "1" else {
+            print("SKIP: EOS hardware test not requested (set PHOTOKICHIN_RUN_HARDWARE_TESTS=1)")
+            return
+        }
+        try runHardwareCameraTests()
+    }
+
+    /// Runs only when explicitly requested. Hardware availability is an
+    /// external condition and must not change the result of deterministic
+    /// tests or make an unconnected camera look like a passing test run.
+    static func runHardwareCameraTests() throws {
         let card = URL(fileURLWithPath: "/Volumes/EOS_DIGITAL")
         guard FileManager.default.fileExists(atPath: card.path) else {
-            print("SKIP: /Volumes/EOS_DIGITAL is not mounted")
-            return
+            throw NSError(
+                domain: "PhotokichinTests",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "PHOTOKICHIN_RUN_HARDWARE_TESTS=1 was set, but /Volumes/EOS_DIGITAL is not mounted"]
+            )
         }
 
         let groups = PhotoScanner.scan(root: card)
@@ -65,7 +75,7 @@ struct PhotokichinTestRunner {
         print("PASS: \(groups.count) EOS R groups, ImageIO metadata, CTG exclusion, verified timestamps, and verified JPG+CR3 import")
     }
 
-    private static func runImportStateTests() throws {
+    static func runImportStateTests() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-state-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -152,7 +162,7 @@ struct PhotokichinTestRunner {
         print("PASS: stable ordering, date-boundary navigation, page navigation, and filters")
     }
 
-    private static func runCameraModelTests() throws {
+    static func runCameraModelTests() throws {
         let cameraMetadata = ImageIOReader.readMetadata(properties: [
             "{Exif}": [
                 "LensModel": "RF24-70mm F2.8 L IS USM",
@@ -266,7 +276,7 @@ struct PhotokichinTestRunner {
         try require(rawOnly.importableVariants == [.raw], "a camera RAW-only photo must import only its CR3")
     }
 
-    private static func runLibraryAirDropTests() throws {
+    static func runLibraryAirDropTests() throws {
         let libraryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("Photokichin-library-airdrop-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: libraryRoot) }
@@ -290,7 +300,7 @@ struct PhotokichinTestRunner {
         try require(both.allSatisfy { FileManager.default.isReadableFile(atPath: $0.path) }, "library AirDrop URLs must be readable files")
     }
 
-    private static func makeGroup(
+    static func makeGroup(
         root: URL,
         jpeg: Bool,
         raw: Bool,
@@ -316,15 +326,15 @@ struct PhotokichinTestRunner {
         )
     }
 
-    private static func runCatalogTests() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-catalog-(UUID().uuidString)", isDirectory: true)
+    static func runCatalogTests() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-catalog-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let importedFolder = root.appendingPathComponent("imported", isDirectory: true)
         let movedFolder = root.appendingPathComponent("moved", isDirectory: true)
         try FileManager.default.createDirectory(at: importedFolder, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: movedFolder, withIntermediateDirectories: true)
 
-        let source = root.deletingLastPathComponent().appendingPathComponent("source-(UUID().uuidString).jpg")
+        let source = root.deletingLastPathComponent().appendingPathComponent("source-\(UUID().uuidString).jpg")
         let contents = Data("photokichin-catalog-test".utf8)
         try contents.write(to: source)
         defer { try? FileManager.default.removeItem(at: source) }
@@ -349,7 +359,7 @@ struct PhotokichinTestRunner {
         try store.relink(issueID: issue.id, to: candidate)
         try require(store.importedDestination(sourceKey: sourceKey, variant: .jpeg)?.standardizedFileURL == candidate.standardizedFileURL, "relink did not update destination")
 
-        let backup = root.deletingLastPathComponent().appendingPathComponent("Photokichin-catalog-backup-(UUID().uuidString).sqlite")
+        let backup = root.deletingLastPathComponent().appendingPathComponent("Photokichin-catalog-backup-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: backup) }
         try store.backup(to: backup)
         try require(FileManager.default.fileExists(atPath: backup.path), "catalog backup was not created")
@@ -358,7 +368,7 @@ struct PhotokichinTestRunner {
         print("PASS: catalog migration, unregistered detection, candidate relink, backup, and integrity check")
     }
 
-    private static func runFilenameIdentityTests() throws {
+    static func runFilenameIdentityTests() throws {
         try require(FilenameIdentity.key(for: "IMG_0001.JPG") == "img_0001.jpg", "filename key should be case-insensitive while retaining the extension")
         try require(FilenameIdentity.key(for: "フォルダ/写真.JPG") == "写真.jpg", "filename key should use only the basename")
 
@@ -423,7 +433,7 @@ struct PhotokichinTestRunner {
         print("PASS: source filename keys, metadata-only candidates, and verified cross-source reuse")
     }
 
-    private static func runSourceIdentityTests() throws {
+    static func runSourceIdentityTests() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-source-identity-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -453,7 +463,7 @@ struct PhotokichinTestRunner {
         print("PASS: Volume UUID source identity and legacy catalog migration")
     }
 
-    private static func runLibraryCopyTests() throws {
+    static func runLibraryCopyTests() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-library-copy-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let sourceRoot = root.appendingPathComponent("source", isDirectory: true)
@@ -500,7 +510,7 @@ struct PhotokichinTestRunner {
         print("PASS: library-to-library JPG/CR3 copy and target catalog registration")
     }
 
-    private static func runLabelTests() throws {
+    static func runLabelTests() throws {
         try require(LabelPalette.colors.count == 32, "the default label palette must contain 32 colors")
         try require(Set(LabelPalette.colors).count == 32, "the default label palette colors must be unique")
         try require(
@@ -575,17 +585,17 @@ struct PhotokichinTestRunner {
         print("PASS: labels, saved views, destination-local label UUIDs, and label-copy boundary")
     }
 
-    private static func requireValue<T>(_ value: T?, _ message: String) throws -> T {
+    static func requireValue<T>(_ value: T?, _ message: String) throws -> T {
         guard let value else { throw NSError(domain: "PhotokichinTests", code: 40, userInfo: [NSLocalizedDescriptionKey: message]) }
         return value
     }
 
-    private static func hash(_ url: URL) throws -> String {
+    static func hash(_ url: URL) throws -> String {
         let data = try Data(contentsOf: url)
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func findFile(named name: String, under root: URL) throws -> URL {
+    static func findFile(named name: String, under root: URL) throws -> URL {
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else {
             throw NSError(domain: "PhotokichinTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "cannot enumerate test directory"])
         }
@@ -593,13 +603,13 @@ struct PhotokichinTestRunner {
         throw NSError(domain: "PhotokichinTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "missing \(name)"])
     }
 
-    private static func require(_ condition: Bool, _ message: String) throws {
+    static func require(_ condition: Bool, _ message: String) throws {
         guard condition else {
             throw NSError(domain: "PhotokichinTests", code: 10, userInfo: [NSLocalizedDescriptionKey: message])
         }
     }
 
-    private static func requireMatchingTimestamp(
+    static func requireMatchingTimestamp(
         _ source: URL,
         _ destination: URL,
         attribute: FileAttributeKey,
