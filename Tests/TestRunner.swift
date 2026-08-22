@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+@testable import PhotokichinCore
 
 @main
 struct PhotokichinTestRunner {

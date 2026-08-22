@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+@testable import PhotokichinCore
 
 /// A test-side completion gate. The loader marks itself as started, then
 /// remains suspended until the test explicitly supplies its result. No sleep,
@@ -110,6 +111,30 @@ private final class LockedValue<Value>: @unchecked Sendable {
     }
 }
 
+private final class ThumbnailDataLoaderRouter: @unchecked Sendable {
+    typealias Loader = @Sendable (URL, Int) async -> Data?
+
+    private let lock = NSLock()
+    private var loader: Loader = { _, _ in nil }
+
+    func setLoader(_ loader: @escaping Loader) {
+        lock.lock()
+        self.loader = loader
+        lock.unlock()
+    }
+
+    func load(url: URL, maxPixel: Int) async -> Data? {
+        let loader = currentLoader()
+        return await loader(url, maxPixel)
+    }
+
+    private func currentLoader() -> Loader {
+        lock.lock()
+        defer { lock.unlock() }
+        return loader
+    }
+}
+
 private final class TestSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
@@ -156,8 +181,7 @@ extension PhotokichinTestRunner {
     }
 
     private static func runMetadataLoadingCoordinatorTests() async throws {
-        let coordinator = MetadataLoadingCoordinator.shared
-        coordinator.cancelAll()
+        let coordinator = MetadataLoadingCoordinator()
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("Photokichin-loading-metadata-\(UUID().uuidString)", isDirectory: true)
@@ -410,7 +434,7 @@ extension PhotokichinTestRunner {
         }
         let small = NSImage(data: data)!
         let large = NSImage(data: data)!
-        let cache = ThumbnailCache.shared
+        let cache = ThumbnailCache()
         cache.store(small, for: url, maxPixel: 100)
         cache.store(large, for: url, maxPixel: 300)
         try require(cache.image(for: url, maxPixel: 100) === small, "thumbnail cache must return the exact requested size")
@@ -420,8 +444,14 @@ extension PhotokichinTestRunner {
     }
 
     private static func runThumbnailLoadingCoordinatorTests() async throws {
-        let coordinator = ThumbnailLoadingCoordinator.shared
-        coordinator.cancelAll()
+        let cache = ThumbnailCache()
+        let dataLoader = ThumbnailDataLoaderRouter()
+        let coordinator = ThumbnailLoadingCoordinator(
+            cache: cache,
+            dataLoader: { url, maxPixel in
+                await dataLoader.load(url: url, maxPixel: maxPixel)
+            }
+        )
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("Photokichin-loading-thumbnail-\(UUID().uuidString)", isDirectory: true)
         coordinator.beginSource(rootURL: root)
@@ -441,20 +471,15 @@ extension PhotokichinTestRunner {
         let signalB = TestSignal()
         let signalC = TestSignal()
 
-#if PHOTOKICHIN_TESTING
-        ThumbnailLoadingCoordinator.testDataLoader = { url, _ in
+        dataLoader.setLoader { url, _ in
             starts.update { $0.append(url.lastPathComponent) }
             if url == groupA.primaryURL { return await gateA.run() }
             if url == groupB.primaryURL { return await gateB.run() }
             if url == groupC.primaryURL { return await gateC.run() }
             return nil
         }
-#endif
         defer {
             coordinator.cancelAll()
-#if PHOTOKICHIN_TESTING
-            ThumbnailLoadingCoordinator.testDataLoader = nil
-#endif
         }
 
         let firstID = coordinator.subscribe(group: groupA, maxPixel: 100, priority: .visible) { image in
@@ -489,8 +514,7 @@ extension PhotokichinTestRunner {
         let sharedSecondSignal = TestSignal()
         var sharedFirstImage = false
         var sharedSecondImage = false
-#if PHOTOKICHIN_TESTING
-        ThumbnailLoadingCoordinator.testDataLoader = { url, _ in
+        dataLoader.setLoader { url, _ in
             if url == sharedGroup.primaryURL {
                 sharedLoads.update { $0 += 1 }
                 let value = await sharedGate.run()
@@ -498,7 +522,6 @@ extension PhotokichinTestRunner {
             }
             return imageData
         }
-#endif
         let sharedFirstID = coordinator.subscribe(group: sharedGroup, maxPixel: 120, priority: .visible) { image in
             sharedFirstImage = image != nil
             sharedFirstSignal.signal()
@@ -538,13 +561,11 @@ extension PhotokichinTestRunner {
         let workingGateB = LoadingGate<Data?>()
         let workingReady = LockedValue<[String]>([])
         let workingSignal = TestSignal()
-#if PHOTOKICHIN_TESTING
-        ThumbnailLoadingCoordinator.testDataLoader = { url, _ in
+        dataLoader.setLoader { url, _ in
             if url == workingA.primaryURL { return await workingGateA.run() }
             if url == workingB.primaryURL { return await workingGateB.run() }
             return imageData
         }
-#endif
         coordinator.updateListWorkingSet(groups: [(workingA, .visible)], maxPixel: 140) { id, _ in
             workingReady.update { $0.append(id) }
             workingSignal.signal()
@@ -568,13 +589,11 @@ extension PhotokichinTestRunner {
         let cancelB = makeLoadingGroup(root: otherRoot, id: "thumbnail-cancel-b", path: "cancel-b.JPG")
         let cancelGateA = LoadingGate<Data?>()
         let cancelGateB = LoadingGate<Data?>()
-#if PHOTOKICHIN_TESTING
-        ThumbnailLoadingCoordinator.testDataLoader = { url, _ in
+        dataLoader.setLoader { url, _ in
             if url == cancelA.primaryURL { return await cancelGateA.run() }
             if url == cancelB.primaryURL { return await cancelGateB.run() }
             return imageData
         }
-#endif
         _ = coordinator.subscribe(group: cancelA, maxPixel: 160, priority: .visible) { _ in }
         await cancelGateA.waitUntilStarted()
         _ = coordinator.subscribe(group: cancelB, maxPixel: 160, priority: .prefetch) { _ in }
@@ -585,12 +604,10 @@ extension PhotokichinTestRunner {
 
         let quiesceGroup = makeLoadingGroup(root: otherRoot, id: "thumbnail-quiesce", path: "thumbnail-quiesce.JPG")
         let quiesceGate = LoadingGate<Data?>()
-#if PHOTOKICHIN_TESTING
-        ThumbnailLoadingCoordinator.testDataLoader = { url, _ in
+        dataLoader.setLoader { url, _ in
             if url == quiesceGroup.primaryURL { return await quiesceGate.run() }
             return imageData
         }
-#endif
         _ = coordinator.subscribe(group: quiesceGroup, maxPixel: 180, priority: .visible) { _ in }
         await quiesceGate.waitUntilStarted()
         let quiesceTask = Task { @MainActor in
@@ -605,12 +622,10 @@ extension PhotokichinTestRunner {
         let resumed = makeLoadingGroup(root: otherRoot, id: "thumbnail-resumed", path: "resumed.JPG")
         let resumedGate = LoadingGate<Data?>()
         let resumedSignal = TestSignal()
-#if PHOTOKICHIN_TESTING
-        ThumbnailLoadingCoordinator.testDataLoader = { url, _ in
+        dataLoader.setLoader { url, _ in
             if url == resumed.primaryURL { return await resumedGate.run() }
             return imageData
         }
-#endif
         _ = coordinator.subscribe(group: resumed, maxPixel: 180, priority: .visible) { image in
             if image != nil { resumedSignal.signal() }
         }

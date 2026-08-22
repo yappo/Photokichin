@@ -1,4 +1,5 @@
 import Foundation
+@testable import PhotokichinCore
 
 extension PhotokichinTestRunner {
     static func runCameraCatalogTests() throws {

@@ -1,4 +1,5 @@
 import Foundation
+@testable import PhotokichinCore
 
 extension PhotokichinTestRunner {
     /// Exercises the removable-volume import path using only temporary files.
@@ -14,7 +15,7 @@ extension PhotokichinTestRunner {
         try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: libraryRoot, withIntermediateDirectories: true)
         let catalog = try CatalogStore(libraryRoot: libraryRoot)
-        let transfer = FileTransferService.shared
+        let transfer = FileTransferService()
 
         let pairDate = Date(timeIntervalSince1970: 1_700_000_000)
         let pairSource = sourceRoot.appendingPathComponent("pair", isDirectory: true)
@@ -39,8 +40,8 @@ extension PhotokichinTestRunner {
         let pairRAW = pairDirectory.appendingPathComponent("IMG_0001.CR3")
         try require(FileManager.default.fileExists(atPath: pairJPEG.path), "imported JPG is missing")
         try require(FileManager.default.fileExists(atPath: pairRAW.path), "imported CR3 is missing")
-        try requireCatalogRecord(catalog, group: pair, variant: .jpeg, destination: pairJPEG, source: pair.jpegURL!)
-        try requireCatalogRecord(catalog, group: pair, variant: .raw, destination: pairRAW, source: pair.rawURL!)
+        try requireCatalogRecord(catalog, transfer: transfer, group: pair, variant: .jpeg, destination: pairJPEG, source: pair.jpegURL!)
+        try requireCatalogRecord(catalog, transfer: transfer, group: pair, variant: .raw, destination: pairRAW, source: pair.rawURL!)
         try requireMatchingTimestamp(pair.jpegURL!, pairJPEG, attribute: .creationDate, label: "JPG creation date")
         try requireMatchingTimestamp(pair.jpegURL!, pairJPEG, attribute: .modificationDate, label: "JPG modification date")
         try requireMatchingTimestamp(pair.rawURL!, pairRAW, attribute: .creationDate, label: "CR3 creation date")
@@ -101,7 +102,7 @@ extension PhotokichinTestRunner {
         try require(jpegOnlyResult.failedCount == 0, "JPG-only import failed: \(jpegOnlyResult.message)")
         let jpegOnlyDestination = libraryDirectory(for: jpegOnly, under: libraryRoot, transfer: transfer)
             .appendingPathComponent("IMG_0002.JPG")
-        try requireCatalogRecord(catalog, group: jpegOnly, variant: .jpeg, destination: jpegOnlyDestination, source: jpegOnly.jpegURL!)
+        try requireCatalogRecord(catalog, transfer: transfer, group: jpegOnly, variant: .jpeg, destination: jpegOnlyDestination, source: jpegOnly.jpegURL!)
         try requireNoPartialFiles(under: jpegOnlyDestination.deletingLastPathComponent())
 
         let rawOnlyDate = Date(timeIntervalSince1970: 1_700_172_800)
@@ -122,7 +123,7 @@ extension PhotokichinTestRunner {
         try require(rawOnlyResult.failedCount == 0, "CR3-only import failed: \(rawOnlyResult.message)")
         let rawOnlyDestination = libraryDirectory(for: rawOnly, under: libraryRoot, transfer: transfer)
             .appendingPathComponent("IMG_0003.CR3")
-        try requireCatalogRecord(catalog, group: rawOnly, variant: .raw, destination: rawOnlyDestination, source: rawOnly.rawURL!)
+        try requireCatalogRecord(catalog, transfer: transfer, group: rawOnly, variant: .raw, destination: rawOnlyDestination, source: rawOnly.rawURL!)
         try requireNoPartialFiles(under: rawOnlyDestination.deletingLastPathComponent())
 
         let missingSource = PhotoGroup(
@@ -196,16 +197,15 @@ extension PhotokichinTestRunner {
             rawData: Data("interrupted-raw-content".utf8),
             captureDate: Date(timeIntervalSince1970: 1_700_432_000)
         )
-        FileTransferService.testCopyFileAll = { sourceURL, partialURL, cancellation in
+        let interruptedTransfer = FileTransferService { sourceURL, partialURL, cancellation, _ in
             let sourceData = try Data(contentsOf: sourceURL)
             let partialByteCount = max(1, sourceData.count / 2)
             try Data(sourceData.prefix(partialByteCount)).write(to: partialURL)
             cancellation?.cancel()
             throw CancellationError()
         }
-        defer { FileTransferService.testCopyFileAll = nil }
         do {
-            _ = try transfer.importGroup(
+            _ = try interruptedTransfer.importGroup(
                 interruptedGroup,
                 to: libraryRoot,
                 template: "{date}_{camera}",
@@ -217,7 +217,7 @@ extension PhotokichinTestRunner {
             // Expected: the test copy seam writes a fixed prefix and then
             // cancels before importGroup can move it to its final filename.
         }
-        let interruptedDirectory = libraryDirectory(for: interruptedGroup, under: libraryRoot, transfer: transfer)
+        let interruptedDirectory = libraryDirectory(for: interruptedGroup, under: libraryRoot, transfer: interruptedTransfer)
         try require(
             !FileManager.default.fileExists(atPath: interruptedDirectory.appendingPathComponent("IMG_0006.JPG").path),
             "an interrupted copy must not leave a completed destination"
@@ -225,14 +225,14 @@ extension PhotokichinTestRunner {
         try requireNoPartialFiles(under: interruptedDirectory)
         try require(
             catalog.importedDestination(
-                sourceKey: transfer.sourceKey(for: interruptedGroup, variant: .jpeg),
+                sourceKey: interruptedTransfer.sourceKey(for: interruptedGroup, variant: .jpeg),
                 variant: .jpeg
             ) == nil,
             "an interrupted copy must not write a JPG catalog record"
         )
         try require(
             catalog.importedDestination(
-                sourceKey: transfer.sourceKey(for: interruptedGroup, variant: .raw),
+                sourceKey: interruptedTransfer.sourceKey(for: interruptedGroup, variant: .raw),
                 variant: .raw
             ) == nil,
             "an interrupted copy must not write a CR3 catalog record"
@@ -294,6 +294,7 @@ extension PhotokichinTestRunner {
 
     private static func requireCatalogRecord(
         _ catalog: CatalogStore,
+        transfer: FileTransferService,
         group: PhotoGroup,
         variant: AssetVariant,
         destination: URL,
@@ -306,7 +307,7 @@ extension PhotokichinTestRunner {
         }
         try require(record.sha256 == hash(source), "catalog SHA-256 does not match \(destination.lastPathComponent)")
         try require(record.fileSize == Int64(sourceData.count), "catalog file size does not match \(destination.lastPathComponent)")
-        let sourceKey = FileTransferService.shared.sourceKey(for: group, variant: variant)
+        let sourceKey = transfer.sourceKey(for: group, variant: variant)
         try require(
             catalog.importedDestination(sourceKey: sourceKey, variant: variant)?.standardizedFileURL.path == destination.standardizedFileURL.path,
             "catalog source identity does not point to \(destination.lastPathComponent)"

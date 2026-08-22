@@ -1,4 +1,73 @@
 import Foundation
+@testable import PhotokichinCore
+
+@MainActor
+private final class TestVolumeMonitor: VolumeMonitoring {
+    var volumes: [MountedVolume] = []
+    var onMount: ((MountedVolume) -> Void)?
+    var onUnmount: ((URL) -> Void)?
+
+    func refresh() {}
+}
+
+@MainActor
+private final class TestCameraMonitor: CameraMonitoring {
+    var onCameraReady: ((CameraDescriptor, [PhotoGroup]) -> Void)?
+    var onCameraCatalogUpdate: ((CameraDescriptor, [PhotoGroup]) -> Void)?
+    var onCameraRemoved: ((String) -> Void)?
+    var onCamerasChanged: (([CameraDescriptor]) -> Void)?
+    var onError: ((String) -> Void)?
+
+    func start() {}
+    func descriptor(for id: String) -> CameraDescriptor? { nil }
+    func groups(for id: String) -> [PhotoGroup]? { nil }
+    func catalogSourceKey(for group: PhotoGroup, variant: AssetVariant) -> String {
+        "camera:test:\(group.id):\(variant.rawValue)"
+    }
+    func eject(id: String) async throws {}
+    func download(
+        group: PhotoGroup,
+        variant: AssetVariant,
+        to directory: URL,
+        filename requestedFilename: String?
+    ) async throws -> URL {
+        throw NSError(
+            domain: "PhotokichinTests",
+            code: 80,
+            userInfo: [NSLocalizedDescriptionKey: "this test camera has no downloadable files"]
+        )
+    }
+    func delete(group: PhotoGroup, variant: AssetVariant) async throws {}
+    func requestMetadata(for group: PhotoGroup) async -> PhotoMetadata? { nil }
+
+    func publishReadyCamera(_ descriptor: CameraDescriptor, groups: [PhotoGroup]) {
+        onCameraReady?(descriptor, groups)
+    }
+}
+
+@MainActor
+private final class AppModelTestEnvironment {
+    let model: AppModel
+    let cameraMonitor: TestCameraMonitor
+    private let defaults: UserDefaults
+    private let suiteName: String
+
+    init() {
+        suiteName = "PhotokichinTests.\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        cameraMonitor = TestCameraMonitor()
+        model = AppModel(
+            volumeMonitor: TestVolumeMonitor(),
+            cameraMonitor: cameraMonitor,
+            userDefaults: defaults
+        )
+    }
+
+    func cleanUp() {
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+}
 
 @MainActor
 extension PhotokichinTestRunner {
@@ -18,16 +87,18 @@ extension PhotokichinTestRunner {
         try createPhotos(in: first, prefix: "FIRST", count: 3)
         try createPhotos(in: second, prefix: "SECOND", count: 2)
 
-        let model = AppModel(testing: true)
-        try require(model.libraryURL == nil, "testing AppModel must not restore a library from UserDefaults")
-        try require(model.libraryURLs.isEmpty, "testing AppModel must not restore saved library URLs")
-        try require(model.volumeMonitor.volumes.isEmpty, "testing AppModel must not inspect mounted volumes")
+        let environment = AppModelTestEnvironment()
+        defer { environment.cleanUp() }
+        let model = environment.model
+        try require(model.libraryURL == nil, "an isolated AppModel must not restore the user's library")
+        try require(model.libraryURLs.isEmpty, "an isolated AppModel must not restore the user's saved library URLs")
+        try require(model.volumeMonitor.volumes.isEmpty, "an isolated AppModel must not inspect mounted volumes")
 
         // No sleep is used here. The second scan invalidates the first token;
         // only the latest directory is allowed to publish its result.
         model.scan(url: first)
         model.scan(url: second)
-        await model.waitForCurrentOperationsForTesting()
+        await model.waitUntilIdle()
 
         try require(model.sourceURL?.standardizedFileURL == second.standardizedFileURL, "the last scan source was not retained")
         try require(model.groups.count == 2, "the last scan did not publish its complete group list")
@@ -38,7 +109,9 @@ extension PhotokichinTestRunner {
     private static func runAppModelSelectionAndNavigationTests() throws {
         let root = try makeTemporaryDirectory(prefix: "Photokichin-appmodel-state")
         defer { try? FileManager.default.removeItem(at: root) }
-        let model = AppModel(testing: true)
+        let environment = AppModelTestEnvironment()
+        defer { environment.cleanUp() }
+        let model = environment.model
         model.sourceURL = root
         model.sourceVolume = MountedVolume(
             id: root.path,
@@ -58,8 +131,7 @@ extension PhotokichinTestRunner {
                 captureDate: Date(timeIntervalSince1970: TimeInterval(index))
             )
         }
-        model.groups = groups
-        model.rebuildDerivedStateForTesting()
+        model.replaceGroups(groups)
         model.setFocus(ids: [groups[0].id])
 
         model.toggleFocusedSelection()
@@ -113,7 +185,9 @@ extension PhotokichinTestRunner {
         try Data("app-model-jpeg".utf8).write(to: jpeg)
         try Data("app-model-raw".utf8).write(to: raw)
 
-        let model = AppModel(testing: true)
+        let environment = AppModelTestEnvironment()
+        defer { environment.cleanUp() }
+        let model = environment.model
         model.sourceURL = source
         model.sourceVolume = MountedVolume(
             id: source.path,
@@ -136,15 +210,14 @@ extension PhotokichinTestRunner {
             importedRAW: false,
             isMetadataLoaded: true
         )
-        model.groups = [group]
-        model.rebuildDerivedStateForTesting()
+        model.replaceGroups([group])
         model.setFocus(ids: [group.id])
         model.toggleFocusedSelection()
 
         model.importSelected(to: destination, template: "{date}_{camera}")
         try require(model.isBusy, "importSelected did not enter the busy state")
         try require(model.operationProgress?.title == "取り込み中", "importSelected did not publish import progress")
-        await model.waitForCurrentOperationsForTesting()
+        await model.waitUntilIdle()
 
         try require(!model.isBusy, "isBusy remained true after import completion")
         try require(model.operationProgress == nil, "operationProgress remained after import completion")
@@ -162,7 +235,9 @@ extension PhotokichinTestRunner {
     }
 
     private static func runAppModelCameraCatalogTests() throws {
-        let model = AppModel(testing: true)
+        let environment = AppModelTestEnvironment()
+        defer { environment.cleanUp() }
+        let model = environment.model
         let descriptor = CameraDescriptor(
             id: "test-camera",
             name: "試験カメラ",
@@ -177,14 +252,17 @@ extension PhotokichinTestRunner {
         let first = (0..<3).map { index in
             makeWorkflowGroup(root: root, id: "camera-\(index)", basename: "CAMERA_\(index)", imported: false, captureDate: Date(timeIntervalSince1970: TimeInterval(index)))
         }
-        model.replaceVisibleCameraCatalogForTesting(descriptor, groups: first)
+        model.sourceCamera = descriptor
+        model.sourceVolume = nil
+        model.sourceURL = CameraMonitor.sourceURL(for: descriptor.id)
+        environment.cameraMonitor.publishReadyCamera(descriptor, groups: first)
         model.setFocus(ids: [first[1].id])
 
         let appended = first + [makeWorkflowGroup(root: root, id: "camera-3", basename: "CAMERA_3", imported: false, captureDate: Date(timeIntervalSince1970: 3))]
-        model.replaceVisibleCameraCatalogForTesting(descriptor, groups: appended)
+        environment.cameraMonitor.publishReadyCamera(descriptor, groups: appended)
         try require(model.focusedIDs == [first[1].id], "camera catalog replacement did not retain an existing focus")
 
-        model.replaceVisibleCameraCatalogForTesting(descriptor, groups: [appended[0], appended[2], appended[3]])
+        environment.cameraMonitor.publishReadyCamera(descriptor, groups: [appended[0], appended[2], appended[3]])
         try require(!model.focusedIDs.isEmpty, "camera catalog replacement left focus empty after the focused photo disappeared")
         try require(model.focusedIDs.isSubset(of: Set([appended[0].id, appended[2].id, appended[3].id])), "camera catalog replacement retained a removed focus")
     }

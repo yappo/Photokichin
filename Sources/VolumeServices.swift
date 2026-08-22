@@ -3,14 +3,22 @@ import DiskArbitration
 import Foundation
 
 @MainActor
-final class VolumeMonitor: ObservableObject {
+protocol VolumeMonitoring: AnyObject {
+    var volumes: [MountedVolume] { get }
+    var onMount: ((MountedVolume) -> Void)? { get set }
+    var onUnmount: ((URL) -> Void)? { get set }
+
+    func refresh()
+}
+
+@MainActor
+final class VolumeMonitor: ObservableObject, VolumeMonitoring {
     @Published private(set) var volumes: [MountedVolume] = []
     var onMount: ((MountedVolume) -> Void)?
     var onUnmount: ((URL) -> Void)?
     private var observers: [NSObjectProtocol] = []
 
-    init(startMonitoring: Bool = true) {
-        guard startMonitoring else { return }
+    init() {
         refresh()
         let workspace = NSWorkspace.shared.notificationCenter
         observers.append(workspace.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] _ in

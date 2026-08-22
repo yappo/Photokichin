@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+@testable import PhotokichinCore
 
 extension PhotokichinTestRunner {
     /// Exercises CatalogStore's state boundaries through its public API.

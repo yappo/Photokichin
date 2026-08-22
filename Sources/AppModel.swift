@@ -137,9 +137,9 @@ final class AppModel: ObservableObject {
     @Published var isLabelManagementPresented = false
     @Published var copyLabelsOnLibraryCopy = true
 
-    let volumeMonitor: VolumeMonitor
-    let cameraMonitor: CameraMonitor
-    private let usesPersistentState: Bool
+    let volumeMonitor: any VolumeMonitoring
+    let cameraMonitor: any CameraMonitoring
+    private let userDefaults: UserDefaults
     private var catalog: CatalogStore?
     private var targetCatalog: CatalogStore?
     private var groupByID: [String: PhotoGroup] = [:]
@@ -175,16 +175,18 @@ final class AppModel: ObservableObject {
     weak var photoSelectionResponder: NSView?
     private var photoIDsByLabelID: [String: Set<String>] = [:]
 
-    init(testing: Bool = false) {
-        usesPersistentState = !testing
-        volumeMonitor = VolumeMonitor(startMonitoring: !testing)
-        cameraMonitor = CameraMonitor.shared
+    init(
+        volumeMonitor: (any VolumeMonitoring)? = nil,
+        cameraMonitor: (any CameraMonitoring)? = nil,
+        userDefaults: UserDefaults = .standard
+    ) {
+        self.volumeMonitor = volumeMonitor ?? VolumeMonitor()
+        self.cameraMonitor = cameraMonitor ?? CameraMonitor.shared
+        self.userDefaults = userDefaults
+        let volumeMonitor = self.volumeMonitor
+        let cameraMonitor = self.cameraMonitor
 
-        if testing {
-            return
-        }
-
-        let defaults = UserDefaults.standard
+        let defaults = userDefaults
         var savedLibraryPaths = defaults.stringArray(forKey: "libraryURLs") ?? []
         if let legacyPath = defaults.string(forKey: "libraryURL"),
            !savedLibraryPaths.contains(legacyPath) {
@@ -257,11 +259,10 @@ final class AppModel: ObservableObject {
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
 
-#if PHOTOKICHIN_TESTING
-    /// Waits for the source scan or import operation that is currently owned
-    /// by this model. Production code keeps these tasks private; deterministic
-    /// tests use this boundary instead of sleeping for an assumed duration.
-    func waitForCurrentOperationsForTesting() async {
+    /// Waits until the source scan and import operations owned by this model
+    /// have finished. Callers can use this when a complete state is required
+    /// before continuing, without assuming how long file operations take.
+    func waitUntilIdle() async {
         while true {
             let currentScan = scanTask
             let currentImport = importTask
@@ -272,26 +273,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Rebuilds the derived collections after a test installs an explicit
-    /// group snapshot. The application always reaches this through scan or a
-    /// catalog callback, so this is deliberately test-only.
-    func rebuildDerivedStateForTesting() {
+    /// Replaces the current photo list and updates every collection derived
+    /// from it as one state change.
+    func replaceGroups(_ groups: [PhotoGroup]) {
+        self.groups = groups
         rebuildGroupedPhotos()
     }
-
-    /// Feeds a completed camera catalog through the same path used by
-    /// ImageCaptureCore callbacks. No camera device or didAdd event is needed.
-    func replaceVisibleCameraCatalogForTesting(
-        _ descriptor: CameraDescriptor,
-        groups: [PhotoGroup],
-        isComplete: Bool = true
-    ) {
-        sourceCamera = descriptor
-        sourceVolume = nil
-        sourceURL = CameraMonitor.sourceURL(for: descriptor.id)
-        updateVisibleCameraCatalog(descriptor, groups: groups, isComplete: isComplete)
-    }
-#endif
 
     var selectedGroups: [PhotoGroup] {
         selectedIDs.compactMap { groupByID[$0] }
@@ -1073,8 +1060,7 @@ final class AppModel: ObservableObject {
         progressText = cameraGroups.isEmpty
             ? "USBカメラの写真一覧を準備しています…"
             : String(cameraGroups.count) + "組を表示中・追加読み込み中"
-        groups = cameraGroups
-        rebuildGroupedPhotos()
+        replaceGroups(cameraGroups)
         if !cameraGroups.isEmpty {
             focusFirstVisiblePhoto()
         }
@@ -1106,8 +1092,7 @@ final class AppModel: ObservableObject {
 
         scanTask?.cancel()
         scanTask = nil
-        self.groups = groups
-        rebuildGroupedPhotos()
+        replaceGroups(groups)
         if let importCatalog = targetCatalog {
             scheduleImportStateEnrichment(
                 groups: groups,
@@ -1286,12 +1271,11 @@ final class AppModel: ObservableObject {
     }
 
     private func persistLibrarySelection() {
-        guard usesPersistentState else { return }
-        UserDefaults.standard.set(libraryURLs.map(\.path), forKey: "libraryURLs")
+        userDefaults.set(libraryURLs.map(\.path), forKey: "libraryURLs")
         if let libraryURL {
-            UserDefaults.standard.set(libraryURL.path, forKey: "libraryURL")
+            userDefaults.set(libraryURL.path, forKey: "libraryURL")
         } else {
-            UserDefaults.standard.removeObject(forKey: "libraryURL")
+            userDefaults.removeObject(forKey: "libraryURL")
         }
     }
 
@@ -1300,8 +1284,7 @@ final class AppModel: ObservableObject {
         if !libraryURLs.contains(where: { $0.standardizedFileURL == normalizedURL }) {
             libraryURLs.append(normalizedURL)
         }
-        guard usesPersistentState else { return normalizedURL }
-        UserDefaults.standard.set(libraryURLs.map(\.path), forKey: "libraryURLs")
+        userDefaults.set(libraryURLs.map(\.path), forKey: "libraryURLs")
         return normalizedURL
     }
 
@@ -2965,7 +2948,7 @@ final class AppModel: ObservableObject {
                 MetadataLoadingCoordinator.shared.enqueue(
                     group: group,
                     priority: priority,
-                    loader: { _ in await CameraMonitor.shared.requestMetadata(for: group) }
+                    loader: { [cameraMonitor] _ in await cameraMonitor.requestMetadata(for: group) }
                 ) { [weak self] metadata in
                     guard let self, self.currentScanToken == token else { return }
                     self.updateCameraMetadata(metadata, for: groupID)

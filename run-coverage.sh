@@ -20,12 +20,19 @@ for source in "$app_dir"/Sources/*.swift; do
 done
 test_files=("$app_dir"/Tests/*.swift)
 test_binary="$coverage_dir/PhotokichinTests"
+core_library="$coverage_dir/libPhotokichinCore.dylib"
 
 swiftc \
   -parse-as-library \
   "${source_files[@]}" \
-  "${test_files[@]}" \
-  -o "$test_binary" \
+  -emit-library \
+  -emit-module \
+  -module-name PhotokichinCore \
+  -enable-testing \
+  -emit-module-path "$coverage_dir/PhotokichinCore.swiftmodule" \
+  -o "$core_library" \
+  -Xlinker -install_name \
+  -Xlinker @rpath/libPhotokichinCore.dylib \
   -framework SwiftUI \
   -framework AppKit \
   -framework ImageIO \
@@ -33,12 +40,31 @@ swiftc \
   -framework DiskArbitration \
   -framework UniformTypeIdentifiers \
   -lsqlite3 \
-  -D PHOTOKICHIN_TESTING \
   -O \
   -profile-generate \
   -profile-coverage-mapping
 
-export LLVM_PROFILE_FILE="$coverage_dir/PhotokichinTests-%p.profraw"
+swiftc \
+  -parse-as-library \
+  "${test_files[@]}" \
+  -I "$coverage_dir" \
+  -L "$coverage_dir" \
+  -lPhotokichinCore \
+  -o "$test_binary" \
+  -Xlinker -rpath \
+  -Xlinker @executable_path \
+  -framework SwiftUI \
+  -framework AppKit \
+  -framework ImageIO \
+  -framework ImageCaptureCore \
+  -framework DiskArbitration \
+  -framework UniformTypeIdentifiers \
+  -lsqlite3 \
+  -O \
+  -profile-generate \
+  -profile-coverage-mapping
+
+export LLVM_PROFILE_FILE="$coverage_dir/PhotokichinTests-%m-%p.profraw"
 "$test_binary"
 
 profile_data="$coverage_dir/PhotokichinTests.profdata"
@@ -49,5 +75,6 @@ echo "Coverage scope: product Sources except PhotokichinApp.swift; Tests exclude
 echo "Coverage meaning: executed product source lines in this deterministic test run"
 xcrun llvm-cov report \
   "$test_binary" \
+  -object "$core_library" \
   -instr-profile="$profile_data" \
   -ignore-filename-regex='/(Tests|PhotokichinApp\.swift)(/|$)'

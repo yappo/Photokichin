@@ -25,15 +25,19 @@ final class ImportCancellationToken: @unchecked Sendable {
 }
 
 final class FileTransferService {
-    static let shared = FileTransferService()
-    private init() {}
+    typealias CopyFileOperation = @Sendable (
+        URL,
+        URL,
+        ImportCancellationToken?,
+        Bool
+    ) throws -> Bool
 
-#if PHOTOKICHIN_TESTING
-    /// Replaces the OS copy operation only in the deterministic test binary.
-    /// The application build does not compile this seam, so its normal copy
-    /// path and performance are unchanged.
-    static var testCopyFileAll: ((URL, URL, ImportCancellationToken?) throws -> Bool)?
-#endif
+    static let shared = FileTransferService()
+    private let copyFileOperation: CopyFileOperation?
+
+    init(copyFileOperation: CopyFileOperation? = nil) {
+        self.copyFileOperation = copyFileOperation
+    }
 
     final class AirDropSession: NSObject, NSSharingServiceDelegate {
         let service: NSSharingService
@@ -563,11 +567,9 @@ final class FileTransferService {
         cancellation: ImportCancellationToken?,
         preferClone: Bool = false
     ) throws -> Bool {
-#if PHOTOKICHIN_TESTING
-        if let testCopyFileAll = Self.testCopyFileAll {
-            return try testCopyFileAll(sourceURL, destinationURL, cancellation)
+        if let copyFileOperation {
+            return try copyFileOperation(sourceURL, destinationURL, cancellation, preferClone)
         }
-#endif
         try cancellation?.check()
         let state = copyfile_state_alloc()
         guard let state else {

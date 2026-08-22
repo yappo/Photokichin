@@ -1,3 +1,5 @@
+@testable import PhotokichinCore
+
 struct PhotokichinTestModule {
     let name: String
     let run: () async throws -> Void

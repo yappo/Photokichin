@@ -534,7 +534,30 @@ enum CameraCatalogBuilder {
 /// camera is a PTP device, not a filesystem volume, so this is intentionally
 /// separate from VolumeMonitor and PhotoScanner.
 @MainActor
-final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, ICDeviceDelegate, ICCameraDeviceDelegate {
+protocol CameraMonitoring: AnyObject {
+    var onCameraReady: ((CameraDescriptor, [PhotoGroup]) -> Void)? { get set }
+    var onCameraCatalogUpdate: ((CameraDescriptor, [PhotoGroup]) -> Void)? { get set }
+    var onCameraRemoved: ((String) -> Void)? { get set }
+    var onCamerasChanged: (([CameraDescriptor]) -> Void)? { get set }
+    var onError: ((String) -> Void)? { get set }
+
+    func start()
+    func descriptor(for id: String) -> CameraDescriptor?
+    func groups(for id: String) -> [PhotoGroup]?
+    func catalogSourceKey(for group: PhotoGroup, variant: AssetVariant) -> String
+    func eject(id: String) async throws
+    func download(
+        group: PhotoGroup,
+        variant: AssetVariant,
+        to directory: URL,
+        filename requestedFilename: String?
+    ) async throws -> URL
+    func delete(group: PhotoGroup, variant: AssetVariant) async throws
+    func requestMetadata(for group: PhotoGroup) async -> PhotoMetadata?
+}
+
+@MainActor
+final class CameraMonitor: NSObject, ObservableObject, CameraMonitoring, ICDeviceBrowserDelegate, ICDeviceDelegate, ICCameraDeviceDelegate {
     static let shared = CameraMonitor()
     private static let catalogRefreshInterval = CameraCatalogRefreshGate.interval
 
