@@ -22,6 +22,102 @@ struct CameraCatalogTests {
         #expect(movie.cameraReference?.asset(for: .movie) != nil)
     }
 
+    @Test("Camera builder groups every contributed rendered and RAW pair")
+    func builderGroupsProductionFormatPairs() throws {
+        let pairs: [(rendered: String, raw: String)] = [
+            ("JPG", "CR3"),
+            ("HIF", "CR3"),
+            ("JPG", "CR2"),
+            ("JPG", "ARW"),
+            ("JPG", "NEF"),
+            ("JPG", "RAF"),
+            ("JPG", "RW2"),
+            ("JPG", "ORF"),
+            ("JPG", "PEF"),
+            ("JPG", "DNG")
+        ]
+
+        for (index, pair) in pairs.enumerated() {
+            let basename = "PAIR_\(index)"
+            let remoteDirectory = "DCIM/100/FORMAT_\(index)"
+            let rendered = cameraAsset(
+                id: "rendered-\(index)",
+                filename: "\(basename).\(pair.rendered)",
+                path: "\(remoteDirectory)/\(basename).\(pair.rendered)",
+                variant: .renderedImage,
+                date: Date(timeIntervalSince1970: Double(index + 1))
+            )
+            let raw = cameraAsset(
+                id: "raw-\(index)",
+                filename: "\(basename).\(pair.raw)",
+                path: "\(remoteDirectory)/\(basename).\(pair.raw)",
+                variant: .raw,
+                date: Date(timeIntervalSince1970: Double(index + 1))
+            )
+            let groups = CameraCatalogBuilder.groups(
+                cameraID: "camera-format-\(index)",
+                cameraName: "Format Camera",
+                entries: [
+                    CameraCatalogEntry(asset: rendered, pairedRaw: nil),
+                    CameraCatalogEntry(asset: raw, pairedRaw: nil)
+                ],
+                previousGroups: [],
+                classifier: InfrastructureTestSupport.classifier
+            )
+            let group = try #require(groups.first, "missing group for \(pair.rendered)+\(pair.raw)")
+            #expect(group.variants == [.renderedImage, .raw])
+            #expect(group.cameraReference?.asset(for: .renderedImage)?.filename == "\(basename).\(pair.rendered)")
+            #expect(group.cameraReference?.asset(for: .raw)?.filename == "\(basename).\(pair.raw)")
+            let downloadTargets = try #require(group.cameraReference?.assets, "missing camera download targets")
+            #expect(downloadTargets.map(\.variant) == [.renderedImage, .raw])
+            #expect(downloadTargets.map(\.filename) == [
+                "\(basename).\(pair.rendered)",
+                "\(basename).\(pair.raw)"
+            ])
+            #expect(group.id.hasSuffix("/\(remoteDirectory)/\(basename)"))
+        }
+    }
+
+    @Test("pairedRawImage-style entries supplement flat camera files for every RAW family")
+    func pairedRawImageSupplementSupportsProductionFormats() throws {
+        let pairs: [(rendered: String, raw: String)] = [
+            ("JPG", "CR3"),
+            ("HIF", "CR3"),
+            ("JPG", "ARW"),
+            ("JPG", "NEF"),
+            ("HIF", "NEF")
+        ]
+
+        for (index, pair) in pairs.enumerated() {
+            let basename = "PAIRED_\(index)"
+            let directory = "DCIM/PAIRED_\(index)"
+            let rendered = cameraAsset(
+                id: "paired-rendered-\(index)",
+                filename: "\(basename).\(pair.rendered)",
+                path: "\(directory)/\(basename).\(pair.rendered)",
+                variant: .renderedImage,
+                date: Date(timeIntervalSince1970: Double(index + 100))
+            )
+            let pairedRaw = cameraAsset(
+                id: "paired-raw-\(index)",
+                filename: "\(basename).\(pair.raw)",
+                path: "\(directory)/\(basename).\(pair.raw)",
+                variant: .raw,
+                date: Date(timeIntervalSince1970: Double(index + 100))
+            )
+            let groups = CameraCatalogBuilder.groups(
+                cameraID: "camera-paired-\(index)",
+                cameraName: "Paired Camera",
+                entries: [CameraCatalogEntry(asset: rendered, pairedRaw: pairedRaw)],
+                previousGroups: [],
+                classifier: InfrastructureTestSupport.classifier
+            )
+            let group = try #require(groups.first, "missing paired group for \(pair.rendered)+\(pair.raw)")
+            #expect(group.cameraReference?.assets.count == 2)
+            #expect(group.cameraReference?.asset(for: .raw)?.identifier == "paired-raw-\(index)")
+        }
+    }
+
     @Test("Camera builder rejects unsupported extensions before grouping")
     func builderRejectsUnsupportedExtensions() {
         #expect(CameraCatalogBuilder.variant(for: "README.TXT", classifier: InfrastructureTestSupport.classifier) == nil)

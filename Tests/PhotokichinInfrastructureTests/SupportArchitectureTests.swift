@@ -31,6 +31,13 @@ private struct MarkerMetadataEnricher: MetadataEnricher {
     }
 }
 
+// Optional real-file validation. Set PHOTOKICHIN_IMAGEIO_SAMPLES to a
+// newline-separated list of `label=/absolute/path` entries. The test is
+// disabled when the variable is absent; synthetic fixtures are deliberately
+// not accepted as ImageIO RAW/HEIF evidence.
+private let imageIOSampleManifest = ProcessInfo.processInfo.environment["PHOTOKICHIN_IMAGEIO_SAMPLES"]
+private let imageIOSampleTestEnabled = imageIOSampleManifest?.isEmpty == false
+
 @Suite("Camera-agnostic support architecture")
 struct SupportArchitectureTests {
     @Test("Asset roles retain their legacy persistence values")
@@ -57,21 +64,137 @@ struct SupportArchitectureTests {
     func productionFormatMappings() throws {
         let genericDefinitions = GenericMediaSupport.definition().mediaFormats
         let generic = try MediaFormatRegistry(definitions: genericDefinitions)
-        #expect(generic.variant(forFilename: "IMG.JPG") == .renderedImage)
-        #expect(generic.variant(forFilename: "IMG.jpeg") == .renderedImage)
-        #expect(generic.variant(forFilename: "CLIP.MOV") == .movie)
-        #expect(generic.variant(forFilename: "CLIP.mp4") == .movie)
+        let genericExpectations: [(String, AssetVariant)] = [
+            ("jpg", .renderedImage), ("jpeg", .renderedImage),
+            ("hif", .renderedImage), ("heif", .renderedImage), ("heic", .renderedImage),
+            ("dng", .raw),
+            ("mov", .movie), ("mp4", .movie)
+        ]
+        for (extensionName, expectedVariant) in genericExpectations {
+            #expect(generic.variant(forFilename: "IMG.\(extensionName)") == expectedVariant)
+            #expect(generic.variant(forFilename: "IMG.\(extensionName.uppercased())") == expectedVariant)
+        }
         #expect(generic.variant(forFilename: "IMG.CR3") == nil)
         #expect(generic.variant(forFilename: "IMG.NEF") == nil)
+        #expect(generic.variant(forFilename: "IMG.NEV") == nil)
+        #expect(generic.variant(forFilename: "IMG.X3F") == nil)
 
-        let productionDefinitions = genericDefinitions + CanonCameraSupport.definition().mediaFormats
+        // Keep the existing Canon JPG + CR3 baseline explicit while extending
+        // the table to all contributed RAW families.
+        let supports = productionSupportDefinitions
+        let productionDefinitions = supports.flatMap(\.mediaFormats)
         let production = try MediaFormatRegistry(definitions: productionDefinitions)
         let reversed = try MediaFormatRegistry(definitions: Array(productionDefinitions.reversed()))
         #expect(production.variant(forFilename: "IMG.CR3") == .raw)
+        #expect(production.variant(forFilename: "IMG.cr3") == .raw)
         #expect(production.variant(forFilename: "IMG.cr3") == reversed.variant(forFilename: "IMG.CR3"))
+        #expect(production.variant(forFilename: "IMG.CR2") == .raw)
+        #expect(production.variant(forFilename: "IMG.cr2") == .raw)
+        for extensionName in ["arw", "nef", "raf", "rw2", "orf", "pef", "dng"] {
+            #expect(production.variant(forFilename: "IMG.\(extensionName.uppercased())") == .raw)
+            #expect(production.variant(forFilename: "IMG.\(extensionName)") == reversed.variant(forFilename: "IMG.\(extensionName)"))
+        }
         #expect(production.variant(forFilename: "IMG.UNKNOWN") == nil)
+        #expect(production.variant(forFilename: "IMG.nev") == nil)
+        #expect(production.variant(forFilename: "IMG.NEV") == nil)
+        #expect(production.variant(forFilename: "IMG.x3f") == nil)
+        #expect(production.variant(forFilename: "IMG.X3F") == nil)
         #expect(reversed.variant(forFilename: "IMG.JPG") == .renderedImage)
         #expect(reversed.variant(forFilename: "CLIP.MP4") == .movie)
+    }
+
+    @Test("Production support contributions have stable ownership and ordering")
+    func productionSupportContributions() throws {
+        let definitions = productionSupportDefinitions
+        #expect(definitions.map(\.identifier) == [
+            GenericMediaSupport.identifier,
+            CanonCameraSupport.identifier,
+            SonyCameraSupport.identifier,
+            NikonCameraSupport.identifier,
+            FujifilmCameraSupport.identifier,
+            PanasonicCameraSupport.identifier,
+            OMSystemCameraSupport.identifier,
+            PentaxCameraSupport.identifier,
+            RicohCameraSupport.identifier,
+            SigmaCameraSupport.identifier
+        ])
+
+        #expect(RicohCameraSupport.definition().mediaFormats.isEmpty)
+        #expect(SigmaCameraSupport.definition().mediaFormats.isEmpty)
+        let dngOwners = definitions.filter { definition in
+            definition.mediaFormats.contains { $0.fileExtensions.contains("dng") }
+        }
+        #expect(dngOwners.map(\.identifier) == [GenericMediaSupport.identifier])
+        #expect(throws: MediaFormatRegistryError.duplicateExtension(
+            "dng",
+            existingIdentifier: "dng",
+            conflictingIdentifier: "duplicate.dng"
+        )) {
+            try MediaFormatRegistry(definitions: [
+                GenericMediaSupport.definition().mediaFormats.first { $0.identifier == "dng" }!,
+                MediaFormatDefinition(identifier: "duplicate.dng", fileExtensions: ["DNG"], variant: .raw)
+            ])
+        }
+
+        let registry = try CameraSupportRegistry(definitions: definitions)
+        let classifier = try MediaFormatRegistry(definitions: registry.definitions.flatMap(\.mediaFormats))
+        #expect(classifier.variant(forFilename: "IMG.NEV") == nil)
+        #expect(classifier.variant(forFilename: "IMG.X3F") == nil)
+    }
+
+    @Test("Each vendor RAW format is isolated to its own contribution")
+    func vendorFormatIsolation() throws {
+        let genericDefinition = GenericMediaSupport.definition()
+        let vendorContributions: [(CameraSupportDefinition, String)] = [
+            (CanonCameraSupport.definition(), "cr3"),
+            (CanonCameraSupport.definition(), "cr2"),
+            (SonyCameraSupport.definition(), "arw"),
+            (NikonCameraSupport.definition(), "nef"),
+            (FujifilmCameraSupport.definition(), "raf"),
+            (PanasonicCameraSupport.definition(), "rw2"),
+            (OMSystemCameraSupport.definition(), "orf"),
+            (PentaxCameraSupport.definition(), "pef")
+        ]
+
+        let genericOnly = try MediaFormatRegistry(definitions: genericDefinition.mediaFormats)
+        for (contribution, extensionName) in vendorContributions {
+            #expect(genericOnly.variant(forFilename: "IMG.\(extensionName)") == nil)
+            let contributed = try MediaFormatRegistry(
+                definitions: genericDefinition.mediaFormats + contribution.mediaFormats
+            )
+            #expect(contributed.variant(forFilename: "IMG.\(extensionName.uppercased())") == .raw)
+        }
+    }
+
+    @Test("Camera matchers use explicit names and preserve PENTAX before RICOH")
+    func cameraMatcherOrderingAndIsolation() {
+        let resolver = CameraSupportResolver(definitions: productionSupportDefinitions)
+        let cases: [(String, String?, String?)] = [
+            (CanonCameraSupport.identifier, "Canon EOS R", nil),
+            (SonyCameraSupport.identifier, "sony ILCE-7", nil),
+            (NikonCameraSupport.identifier, nil, "NIKON Camera"),
+            (FujifilmCameraSupport.identifier, "Fujifilm X-T5", nil),
+            (PanasonicCameraSupport.identifier, "LUMIX S5II", nil),
+            (PanasonicCameraSupport.identifier, nil, "Panasonic Camera"),
+            (OMSystemCameraSupport.identifier, "OM SYSTEM OM-1", nil),
+            (OMSystemCameraSupport.identifier, "OM Digital Solutions Camera", nil),
+            (OMSystemCameraSupport.identifier, "Olympus OM-D", nil),
+            (PentaxCameraSupport.identifier, "PENTAX RICOH Camera", nil),
+            (RicohCameraSupport.identifier, "RICOH GR III", nil),
+            (SigmaCameraSupport.identifier, "SIGMA fp", nil)
+        ]
+
+        for (expected, reportedName, productKind) in cases {
+            let identity = CameraIdentity(reportedName: reportedName, productKind: productKind, usbVendorID: nil, usbProductID: nil)
+            #expect(resolver.supportIdentifier(for: identity) == expected)
+        }
+
+        #expect(resolver.supportIdentifier(for: CameraIdentity(reportedName: "Camera", productKind: "Still Image", usbVendorID: 123, usbProductID: 456)) == nil)
+        #expect(resolver.supportIdentifier(for: CameraIdentity(reportedName: "Unknown Camera", productKind: nil, usbVendorID: nil, usbProductID: nil)) == nil)
+    }
+
+    private var productionSupportDefinitions: [CameraSupportDefinition] {
+        InfrastructureComposition.production().cameraSupportResolver.definitions
     }
 
     @Test("Registry normalizes extensions and rejects duplicate ownership")
@@ -115,6 +238,7 @@ struct SupportArchitectureTests {
         #expect(generic.variant(forFilename: "IMG.JPG") == .renderedImage)
         #expect(generic.variant(forFilename: "CLIP.MP4") == .movie)
         #expect(generic.variant(forFilename: "IMG.CR3") == nil)
+        #expect(generic.variant(forFilename: "IMG.CR2") == nil)
 
         let identity = CameraIdentity(reportedName: "Canon EOS R", productKind: "Camera", usbVendorID: 0, usbProductID: -1)
         #expect(identity.usbVendorID == nil && identity.usbProductID == nil)
@@ -428,6 +552,72 @@ struct SupportArchitectureTests {
         #expect(urlMetadata.firmware == "pipeline-marker")
     }
 
+    @Test(
+        "Provided real samples can be inspected through ImageIO",
+        .enabled(if: imageIOSampleTestEnabled, "PHOTOKICHIN_IMAGEIO_SAMPLES=label=/absolute/path\n... のときだけ実行します")
+    )
+    func imageIOSampleFiles() throws {
+        let manifest = try #require(imageIOSampleManifest)
+        let entries = manifest.split(whereSeparator: \.isNewline).compactMap { line -> (label: String, url: URL)? in
+            let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty, !text.hasPrefix("#"),
+                  let separator = text.firstIndex(of: "=") else { return nil }
+            let label = String(text[..<separator]).trimmingCharacters(in: .whitespaces)
+            let path = String(text[text.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
+            guard !label.isEmpty, !path.isEmpty, path.hasPrefix("/") else { return nil }
+            return (label, URL(fileURLWithPath: path))
+        }
+        try #require(!entries.isEmpty, "PHOTOKICHIN_IMAGEIO_SAMPLES に有効な label=/absolute/path がありません")
+
+        let reader = ImageIOMediaReader(pipeline: InfrastructureComposition.production().metadataPipeline)
+        for entry in entries {
+            try #require(
+                FileManager.default.fileExists(atPath: entry.url.path),
+                "ImageIO sample がありません: \(entry.label) -> \(entry.url.path)"
+            )
+            let source = try #require(
+                CGImageSourceCreateWithURL(entry.url as CFURL, nil),
+                "ImageIO source を作成できません: \(entry.label) -> \(entry.url.path)"
+            )
+            let properties = try #require(
+                CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+                "ImageIO properties を取得できません: \(entry.label)"
+            )
+            _ = try #require(
+                reader.thumbnailData(url: entry.url, maxPixel: 512),
+                "ImageIO thumbnail を生成できません: \(entry.label)"
+            )
+            let metadata = try #require(
+                reader.readMetadata(url: entry.url),
+                "metadata を取得できません: \(entry.label)"
+            )
+            let width = try #require(
+                properties[kCGImagePropertyPixelWidth as String] as? Int,
+                "ImageIO width がありません: \(entry.label)"
+            )
+            let height = try #require(
+                properties[kCGImagePropertyPixelHeight as String] as? Int,
+                "ImageIO height がありません: \(entry.label)"
+            )
+            let captureDate = try #require(metadata.captureDate, "captureDate がありません: \(entry.label)")
+            let cameraMake = try #require(metadata.cameraMake, "cameraMake がありません: \(entry.label)")
+            let cameraModel = try #require(metadata.cameraModel, "cameraModel がありません: \(entry.label)")
+            let lensModel = try #require(metadata.lensModel, "lensModel がありません: \(entry.label)")
+            let orientation = try #require(metadata.orientation, "orientation がありません: \(entry.label)")
+            _ = try #require(metadata.pixelWidth, "metadata pixelWidth がありません: \(entry.label)")
+            _ = try #require(metadata.pixelHeight, "metadata pixelHeight がありません: \(entry.label)")
+            print(
+                "ImageIO sample \(entry.label): " +
+                "captureDate=\(captureDate), " +
+                "make=\(cameraMake), " +
+                "model=\(cameraModel), " +
+                "lens=\(lensModel), " +
+                "orientation=\(orientation), " +
+                "dimensions=\(width)x\(height)"
+            )
+        }
+    }
+
     @Test("Generic consumers do not embed vendor format knowledge")
     func genericArchitectureGuard() throws {
         let testFile = URL(fileURLWithPath: #filePath)
@@ -446,7 +636,6 @@ struct SupportArchitectureTests {
             "MakerCanon",
             "CANONMSC",
             "\"EOS R\"",
-            "\"cr3\"",
             "AssetVariant.jpeg",
             "jpegURL",
             "importedJPEG",
@@ -454,12 +643,61 @@ struct SupportArchitectureTests {
             "jpegAndRaw",
             "jpegOnly"
         ]
+        let forbiddenQuotedExtensions = [
+            "\"jpg\"", "\"jpeg\"", "\"hif\"", "\"heif\"", "\"heic\"",
+            "\"cr3\"", "\"cr2\"", "\"arw\"", "\"nef\"", "\"raf\"", "\"rw2\"",
+            "\"orf\"", "\"pef\"", "\"dng\"", "\"mov\"", "\"mp4\"", "\"nev\"", "\"x3f\""
+        ]
+        let forbiddenQuotedManufacturers = [
+            "\"Canon\"", "\"Sony\"", "\"Nikon\"", "\"FUJIFILM\"", "\"Panasonic\"",
+            "\"LUMIX\"", "\"Olympus\"", "\"OM SYSTEM\"", "\"OM Digital Solutions\"",
+            "\"PENTAX\"", "\"RICOH\"", "\"SIGMA\""
+        ]
+        let baselineUncheckedSendableCounts = [
+            "Sources/PhotokichinInfrastructure/FileSystem/PhotoScanner.swift": 0,
+            "Sources/PhotokichinInfrastructure/Camera/CameraServices.swift": 1,
+            "Sources/PhotokichinInfrastructure/Catalog/CatalogStore.swift": 1,
+            "Sources/PhotokichinInfrastructure/FileSystem/MetadataReading.swift": 0,
+            "Sources/PhotokichinInfrastructure/FileSystem/FileTransfer.swift": 0
+        ]
+        func offsets(of tokens: [String], in contents: String) -> [Int] {
+            tokens.compactMap { token in
+                guard let range = contents.range(of: token) else { return nil }
+                return contents.distance(from: contents.startIndex, to: range.lowerBound)
+            }
+        }
 
         for relativePath in genericSources {
             let source = repositoryRoot.appendingPathComponent(relativePath)
             let contents = try String(contentsOf: source, encoding: .utf8)
-            for token in forbidden {
-                #expect(!contents.contains(token), "\(relativePath) contains forbidden generic-core token: \(token)")
+            for token in forbidden + forbiddenQuotedExtensions + forbiddenQuotedManufacturers {
+                #expect(!contents.localizedCaseInsensitiveContains(token), "\(relativePath) contains forbidden generic-core token: \(token)")
+            }
+            let uncheckedCount = contents.components(separatedBy: "@unchecked Sendable").count - 1
+            #expect(
+                uncheckedCount == baselineUncheckedSendableCounts[relativePath],
+                "\(relativePath) changed its baseline @unchecked Sendable count"
+            )
+
+            if relativePath == "Sources/PhotokichinInfrastructure/FileSystem/PhotoScanner.swift" {
+                let order = offsets(of: [
+                    "traversalPolicy.shouldSkipDirectory",
+                    "classifier.variant(forFilename:",
+                    "url.resourceValues(forKeys:"
+                ], in: contents)
+                #expect(order.count == 3, "PhotoScanner order guard could not find all I/O boundaries")
+                #expect(order == order.sorted(), "PhotoScanner must check traversal, classifier, then resourceValues")
+            }
+
+            if relativePath == "Sources/PhotokichinInfrastructure/Catalog/CatalogStore.swift",
+               let functionRange = contents.range(of: "private func photoFiles(in root: URL)") {
+                let functionBody = String(contents[functionRange.upperBound...])
+                let order = offsets(of: [
+                    "classifier.variant(forFilename:",
+                    "url.resourceValues(forKeys:"
+                ], in: functionBody)
+                #expect(order.count == 2, "CatalogStore photoFiles order guard could not find both boundaries")
+                #expect(order == order.sorted(), "CatalogStore photoFiles must classify before resourceValues")
             }
         }
     }

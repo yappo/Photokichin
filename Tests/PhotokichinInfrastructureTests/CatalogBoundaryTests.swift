@@ -353,6 +353,49 @@ struct CatalogBoundaryTests {
         #expect(!FileManager.default.fileExists(atPath: cameraDestination.path), "camera reuse must not create a duplicate destination file")
     }
 
+    @Test("Library inspection uses the shared classifier for all contributed still-image formats")
+    func inspectionRecognizesProductionStillFormats() throws {
+        let root = temporaryRoot(named: "catalog-production-formats")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
+
+        let baselineFiles: [(String, AssetVariant)] = [
+            ("baseline/IMG_BASE.JPG", .renderedImage),
+            ("baseline/IMG_BASE.CR3", .raw),
+            ("baseline/IMG_PAIR.JPG", .renderedImage),
+            ("baseline/IMG_PAIR.CR3", .raw)
+        ]
+        for (relativePath, variant) in baselineFiles {
+            let url = root.appendingPathComponent(relativePath)
+            try write(Data("registered \(relativePath)".utf8), to: url)
+            try store.recordLibraryAsset(
+                url: url,
+                variant: variant,
+                sha256: boundaryHash(url),
+                fileSize: Int64(try Data(contentsOf: url).count)
+            )
+        }
+
+        let contributedExtensions = ["HIF", "HEIF", "HEIC", "CR2", "ARW", "NEF", "RAF", "RW2", "ORF", "PEF", "DNG"]
+        for (index, extensionName) in contributedExtensions.enumerated() {
+            try write(
+                Data("unregistered \(extensionName)".utf8),
+                to: root.appendingPathComponent("unregistered/IMG_\(index).\(extensionName)")
+            )
+        }
+
+        // Movies, excluded RAW movie, excluded Sigma X3F, and unknown files
+        // must not enter the still-image library inspection count.
+        for filename in ["CLIP.MOV", "CLIP.MP4", "CLIP.NEV", "PHOTO.X3F", "README.TXT"] {
+            try write(Data("ignored \(filename)".utf8), to: root.appendingPathComponent("ignored/\(filename)"))
+        }
+
+        let inspection = try store.inspectLibrary()
+        #expect(inspection.summary.registeredAssetCount == baselineFiles.count)
+        #expect(inspection.summary.unregisteredPhotoCount == contributedExtensions.count)
+    }
+
     private func record(_ store: CatalogStore, sourceKey: String, destination: URL, data: Data) throws {
         try write(data, to: destination)
         try store.recordImport(

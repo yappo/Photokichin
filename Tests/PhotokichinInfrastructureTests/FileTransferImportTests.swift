@@ -37,6 +37,61 @@ struct FileTransferImportTests {
         try requireNoPartialFiles(under: destination)
     }
 
+    @Test("New rendered and RAW pairs import through the generic transfer path")
+    func newRenderedAndRawPairsImport() throws {
+        let pairs: [(rendered: String, raw: String)] = [
+            ("HIF", "CR3"),
+            ("JPG", "CR2"),
+            ("JPG", "ARW"),
+            ("JPG", "NEF"),
+            ("JPG", "RAF"),
+            ("JPG", "RW2"),
+            ("JPG", "ORF"),
+            ("JPG", "PEF"),
+            ("JPG", "DNG")
+        ]
+
+        for (index, pair) in pairs.enumerated() {
+            let fixture = try makeFixture(prefix: "format-pair-\(index)")
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let basename = "IMG_PAIR_\(index)"
+            let group = try makeImportGroup(
+                sourceRoot: fixture.source.appendingPathComponent("pair"),
+                basename: basename,
+                jpegData: Data("rendered-\(pair.rendered)".utf8),
+                rawData: Data("raw-\(pair.raw)".utf8),
+                captureDate: Date(timeIntervalSince1970: 1_700_500_000 + Double(index)),
+                renderedExtension: pair.rendered,
+                rawExtension: pair.raw
+            )
+            let result = try fixture.transfer.importGroup(
+                group,
+                to: fixture.library,
+                template: "{date}_{camera}",
+                catalog: fixture.catalog
+            )
+            let destination = libraryDirectory(for: group, under: fixture.library, transfer: fixture.transfer)
+            #expect(result.copiedCount == 2, "\(pair.rendered)+\(pair.raw) should copy two files")
+            #expect(result.failedCount == 0, "\(pair.rendered)+\(pair.raw) import failed: \(result.message)")
+            try requireCatalogRecord(
+                fixture.catalog,
+                transfer: fixture.transfer,
+                group: group,
+                variant: .renderedImage,
+                destination: destination.appendingPathComponent("\(basename).\(pair.rendered)"),
+                source: group.renderedImageURL!
+            )
+            try requireCatalogRecord(
+                fixture.catalog,
+                transfer: fixture.transfer,
+                group: group,
+                variant: .raw,
+                destination: destination.appendingPathComponent("\(basename).\(pair.raw)"),
+                source: group.rawURL!
+            )
+        }
+    }
+
     @Test("Import uses Camera as the fallback folder and preserves a reported camera model")
     func importFolderFallbackUsesGenericCameraName() throws {
         let fixture = try makeFixture(prefix: "camera-folder-fallback")
@@ -173,6 +228,76 @@ struct FileTransferImportTests {
         try requireNoPartialFiles(under: destination)
     }
 
+    @Test("All contributed RAW-only formats import as the legacy RAW variant")
+    func contributedRawOnlyImports() throws {
+        let extensions = ["CR3", "CR2", "ARW", "NEF", "RAF", "RW2", "ORF", "PEF", "DNG"]
+        for (index, extensionName) in extensions.enumerated() {
+            let fixture = try makeFixture(prefix: "format-raw-only-\(index)")
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let basename = "RAW_ONLY_\(index)"
+            let group = try makeImportGroup(
+                sourceRoot: fixture.source.appendingPathComponent("raw"),
+                basename: basename,
+                jpegData: nil,
+                rawData: Data("raw-only-\(extensionName)".utf8),
+                captureDate: Date(timeIntervalSince1970: 1_701_000_000 + Double(index)),
+                rawExtension: extensionName
+            )
+            let result = try fixture.transfer.importGroup(
+                group,
+                to: fixture.library,
+                template: "{date}_{camera}",
+                catalog: fixture.catalog
+            )
+            let destination = libraryDirectory(for: group, under: fixture.library, transfer: fixture.transfer)
+            #expect(result.copiedCount == 1)
+            #expect(result.failedCount == 0)
+            try requireCatalogRecord(
+                fixture.catalog,
+                transfer: fixture.transfer,
+                group: group,
+                variant: .raw,
+                destination: destination.appendingPathComponent("\(basename).\(extensionName)"),
+                source: group.rawURL!
+            )
+        }
+    }
+
+    @Test("All contributed rendered-only formats import as the legacy rendered variant")
+    func contributedRenderedOnlyImports() throws {
+        let extensions = ["JPG", "JPEG", "HIF", "HEIF", "HEIC"]
+        for (index, extensionName) in extensions.enumerated() {
+            let fixture = try makeFixture(prefix: "format-rendered-only-\(index)")
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let basename = "RENDERED_ONLY_\(index)"
+            let group = try makeImportGroup(
+                sourceRoot: fixture.source.appendingPathComponent("rendered"),
+                basename: basename,
+                jpegData: Data("rendered-only-\(extensionName)".utf8),
+                rawData: nil,
+                captureDate: Date(timeIntervalSince1970: 1_702_000_000 + Double(index)),
+                renderedExtension: extensionName
+            )
+            let result = try fixture.transfer.importGroup(
+                group,
+                to: fixture.library,
+                template: "{date}_{camera}",
+                catalog: fixture.catalog
+            )
+            let destination = libraryDirectory(for: group, under: fixture.library, transfer: fixture.transfer)
+            #expect(result.copiedCount == 1)
+            #expect(result.failedCount == 0)
+            try requireCatalogRecord(
+                fixture.catalog,
+                transfer: fixture.transfer,
+                group: group,
+                variant: .renderedImage,
+                destination: destination.appendingPathComponent("\(basename).\(extensionName)"),
+                source: group.renderedImageURL!
+            )
+        }
+    }
+
     @Test("Missing JPG and CR3 sources report two failures and no catalog records")
     func missingSourcesFailWithoutRecords() throws {
         let fixture = try makeFixture(prefix: "missing-source")
@@ -241,10 +366,18 @@ struct FileTransferImportTests {
         return Fixture(root: root, source: source, library: library, catalog: try InfrastructureTestSupport.catalogStore(libraryRoot: library), transfer: FileTransferService())
     }
 
-    private func makeImportGroup(sourceRoot: URL, basename: String, jpegData: Data?, rawData: Data?, captureDate: Date) throws -> PhotoGroup {
+    private func makeImportGroup(
+        sourceRoot: URL,
+        basename: String,
+        jpegData: Data?,
+        rawData: Data?,
+        captureDate: Date,
+        renderedExtension: String = "JPG",
+        rawExtension: String = "CR3"
+    ) throws -> PhotoGroup {
         try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
-        let renderedImageURL = jpegData.map { _ in sourceRoot.appendingPathComponent("\(basename).JPG") }
-        let rawURL = rawData.map { _ in sourceRoot.appendingPathComponent("\(basename).CR3") }
+        let renderedImageURL = jpegData.map { _ in sourceRoot.appendingPathComponent("\(basename).\(renderedExtension)") }
+        let rawURL = rawData.map { _ in sourceRoot.appendingPathComponent("\(basename).\(rawExtension)") }
         if let jpegData, let renderedImageURL {
             try jpegData.write(to: renderedImageURL)
             try setTestTimestamps(renderedImageURL, creationDate: captureDate, modificationDate: captureDate.addingTimeInterval(7))

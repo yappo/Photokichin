@@ -191,6 +191,22 @@ private struct CanonCameraMatcher: CameraSupportMatcher {
     }
 }
 
+/// Matches only the manufacturer names explicitly contributed by a camera
+/// support. Matching is intentionally limited to the reported name and
+/// product kind; USB identifiers are not used to infer a manufacturer.
+private struct NamedCameraMatcher: CameraSupportMatcher {
+    let supportIdentifier: String
+    let manufacturerNames: [String]
+
+    func matches(_ identity: CameraIdentity) -> Bool {
+        [identity.reportedName, identity.productKind].compactMap { $0 }.contains { value in
+            manufacturerNames.contains { manufacturerName in
+                value.range(of: manufacturerName, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+            }
+        }
+    }
+}
+
 struct CameraSupportDefinition: Sendable {
     let identifier: String
     let mediaFormats: [MediaFormatDefinition]
@@ -226,6 +242,16 @@ enum GenericMediaSupport {
                     variant: .renderedImage
                 ),
                 MediaFormatDefinition(
+                    identifier: "heif",
+                    fileExtensions: ["hif", "heif", "heic"],
+                    variant: .renderedImage
+                ),
+                MediaFormatDefinition(
+                    identifier: "dng",
+                    fileExtensions: ["dng"],
+                    variant: .raw
+                ),
+                MediaFormatDefinition(
                     identifier: "movie",
                     fileExtensions: ["mov", "mp4"],
                     variant: .movie
@@ -246,11 +272,151 @@ enum CanonCameraSupport {
                     identifier: "canon.cr3",
                     fileExtensions: ["cr3"],
                     variant: .raw
+                ),
+                MediaFormatDefinition(
+                    identifier: "canon.cr2",
+                    fileExtensions: ["cr2"],
+                    variant: .raw
                 )
             ],
             filesystemTraversalRules: [CanonManagementDirectoryRule()],
             metadataEnrichers: [CanonMetadataEnricher()],
             cameraMatchers: [CanonCameraMatcher()]
+        )
+    }
+}
+
+enum SonyCameraSupport {
+    static let identifier = "SonyCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [
+                MediaFormatDefinition(
+                    identifier: "sony.arw",
+                    fileExtensions: ["arw"],
+                    variant: .raw
+                )
+            ],
+            cameraMatchers: [NamedCameraMatcher(supportIdentifier: identifier, manufacturerNames: ["Sony"])]
+        )
+    }
+}
+
+enum NikonCameraSupport {
+    static let identifier = "NikonCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [
+                MediaFormatDefinition(
+                    identifier: "nikon.nef",
+                    fileExtensions: ["nef"],
+                    variant: .raw
+                )
+            ],
+            cameraMatchers: [NamedCameraMatcher(supportIdentifier: identifier, manufacturerNames: ["Nikon"])]
+        )
+    }
+}
+
+enum FujifilmCameraSupport {
+    static let identifier = "FujifilmCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [
+                MediaFormatDefinition(
+                    identifier: "fujifilm.raf",
+                    fileExtensions: ["raf"],
+                    variant: .raw
+                )
+            ],
+            cameraMatchers: [NamedCameraMatcher(supportIdentifier: identifier, manufacturerNames: ["FUJIFILM"])]
+        )
+    }
+}
+
+enum PanasonicCameraSupport {
+    static let identifier = "PanasonicCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [
+                MediaFormatDefinition(
+                    identifier: "panasonic.rw2",
+                    fileExtensions: ["rw2"],
+                    variant: .raw
+                )
+            ],
+            cameraMatchers: [NamedCameraMatcher(supportIdentifier: identifier, manufacturerNames: ["Panasonic", "LUMIX"])]
+        )
+    }
+}
+
+enum OMSystemCameraSupport {
+    static let identifier = "OMSystemCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [
+                MediaFormatDefinition(
+                    identifier: "omsystem.orf",
+                    fileExtensions: ["orf"],
+                    variant: .raw
+                )
+            ],
+            cameraMatchers: [NamedCameraMatcher(
+                supportIdentifier: identifier,
+                manufacturerNames: ["OM SYSTEM", "OM Digital Solutions", "Olympus"]
+            )]
+        )
+    }
+}
+
+enum PentaxCameraSupport {
+    static let identifier = "PentaxCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [
+                MediaFormatDefinition(
+                    identifier: "pentax.pef",
+                    fileExtensions: ["pef"],
+                    variant: .raw
+                )
+            ],
+            cameraMatchers: [NamedCameraMatcher(supportIdentifier: identifier, manufacturerNames: ["PENTAX"])]
+        )
+    }
+}
+
+enum RicohCameraSupport {
+    static let identifier = "RicohCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [],
+            cameraMatchers: [NamedCameraMatcher(supportIdentifier: identifier, manufacturerNames: ["RICOH"])]
+        )
+    }
+}
+
+enum SigmaCameraSupport {
+    static let identifier = "SigmaCameraSupport"
+
+    static func definition() -> CameraSupportDefinition {
+        CameraSupportDefinition(
+            identifier: identifier,
+            mediaFormats: [],
+            cameraMatchers: [NamedCameraMatcher(supportIdentifier: identifier, manufacturerNames: ["SIGMA"])]
         )
     }
 }
@@ -307,7 +473,18 @@ struct InfrastructureComposition: Sendable {
     static func production() -> InfrastructureComposition {
         do {
             let supportRegistry = try CameraSupportRegistry(
-                definitions: [GenericMediaSupport.definition(), CanonCameraSupport.definition()]
+                definitions: [
+                    GenericMediaSupport.definition(),
+                    CanonCameraSupport.definition(),
+                    SonyCameraSupport.definition(),
+                    NikonCameraSupport.definition(),
+                    FujifilmCameraSupport.definition(),
+                    PanasonicCameraSupport.definition(),
+                    OMSystemCameraSupport.definition(),
+                    PentaxCameraSupport.definition(),
+                    RicohCameraSupport.definition(),
+                    SigmaCameraSupport.definition()
+                ]
             )
             let definitions = supportRegistry.definitions
             let classifier = try MediaFormatRegistry(
