@@ -137,8 +137,9 @@ final class AppModel: ObservableObject {
     @Published var isLabelManagementPresented = false
     @Published var copyLabelsOnLibraryCopy = true
 
-    let volumeMonitor = VolumeMonitor()
-    let cameraMonitor = CameraMonitor.shared
+    let volumeMonitor: VolumeMonitor
+    let cameraMonitor: CameraMonitor
+    private let usesPersistentState: Bool
     private var catalog: CatalogStore?
     private var targetCatalog: CatalogStore?
     private var groupByID: [String: PhotoGroup] = [:]
@@ -174,7 +175,15 @@ final class AppModel: ObservableObject {
     weak var photoSelectionResponder: NSView?
     private var photoIDsByLabelID: [String: Set<String>] = [:]
 
-    init() {
+    init(testing: Bool = false) {
+        usesPersistentState = !testing
+        volumeMonitor = VolumeMonitor(startMonitoring: !testing)
+        cameraMonitor = CameraMonitor.shared
+
+        if testing {
+            return
+        }
+
         let defaults = UserDefaults.standard
         var savedLibraryPaths = defaults.stringArray(forKey: "libraryURLs") ?? []
         if let legacyPath = defaults.string(forKey: "libraryURL"),
@@ -247,6 +256,42 @@ final class AppModel: ObservableObject {
         catalogVerificationWorkerTask?.cancel()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
+
+#if PHOTOKICHIN_TESTING
+    /// Waits for the source scan or import operation that is currently owned
+    /// by this model. Production code keeps these tasks private; deterministic
+    /// tests use this boundary instead of sleeping for an assumed duration.
+    func waitForCurrentOperationsForTesting() async {
+        while true {
+            let currentScan = scanTask
+            let currentImport = importTask
+            if currentScan == nil, currentImport == nil { return }
+            if let currentScan { await currentScan.value }
+            if let currentImport { await currentImport.value }
+            await Task.yield()
+        }
+    }
+
+    /// Rebuilds the derived collections after a test installs an explicit
+    /// group snapshot. The application always reaches this through scan or a
+    /// catalog callback, so this is deliberately test-only.
+    func rebuildDerivedStateForTesting() {
+        rebuildGroupedPhotos()
+    }
+
+    /// Feeds a completed camera catalog through the same path used by
+    /// ImageCaptureCore callbacks. No camera device or didAdd event is needed.
+    func replaceVisibleCameraCatalogForTesting(
+        _ descriptor: CameraDescriptor,
+        groups: [PhotoGroup],
+        isComplete: Bool = true
+    ) {
+        sourceCamera = descriptor
+        sourceVolume = nil
+        sourceURL = CameraMonitor.sourceURL(for: descriptor.id)
+        updateVisibleCameraCatalog(descriptor, groups: groups, isComplete: isComplete)
+    }
+#endif
 
     var selectedGroups: [PhotoGroup] {
         selectedIDs.compactMap { groupByID[$0] }
@@ -1241,6 +1286,7 @@ final class AppModel: ObservableObject {
     }
 
     private func persistLibrarySelection() {
+        guard usesPersistentState else { return }
         UserDefaults.standard.set(libraryURLs.map(\.path), forKey: "libraryURLs")
         if let libraryURL {
             UserDefaults.standard.set(libraryURL.path, forKey: "libraryURL")
@@ -1254,6 +1300,7 @@ final class AppModel: ObservableObject {
         if !libraryURLs.contains(where: { $0.standardizedFileURL == normalizedURL }) {
             libraryURLs.append(normalizedURL)
         }
+        guard usesPersistentState else { return normalizedURL }
         UserDefaults.standard.set(libraryURLs.map(\.path), forKey: "libraryURLs")
         return normalizedURL
     }

@@ -48,6 +48,12 @@ final class ThumbnailCache {
 final class ThumbnailLoadingCoordinator {
     static let shared = ThumbnailLoadingCoordinator()
 
+#if PHOTOKICHIN_TESTING
+    /// Replaces ImageIO only in the deterministic test binary. The release
+    /// build keeps the detached ImageIO read and its normal performance path.
+    static var testDataLoader: (@Sendable (URL, Int) async -> Data?)?
+#endif
+
     private final class Request {
         let id = UUID()
         let key: ThumbnailKey
@@ -306,9 +312,19 @@ final class ThumbnailLoadingCoordinator {
             guard !request.observers.isEmpty else { continue }
             active[request.key] = request
 
+#if PHOTOKICHIN_TESTING
+            let testDataLoader = Self.testDataLoader
+            let task = Task.detached(priority: .utility) {
+                if let testDataLoader {
+                    return await testDataLoader(request.url, request.key.maxPixel)
+                }
+                return ImageIOReader.thumbnailData(url: request.url, maxPixel: request.key.maxPixel)
+            }
+#else
             let task = Task.detached(priority: .utility) {
                 ImageIOReader.thumbnailData(url: request.url, maxPixel: request.key.maxPixel)
             }
+#endif
             request.task = task
             let requestID = request.id
             let key = request.key

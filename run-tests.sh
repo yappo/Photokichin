@@ -7,20 +7,26 @@ rm -rf "$test_dir"
 mkdir -p "$test_dir"
 export CLANG_MODULE_CACHE_PATH="$test_dir/ModuleCache"
 
+source_files=()
+for source in "$app_dir"/Sources/*.swift; do
+    [[ "$source" == "$app_dir/Sources/PhotokichinApp.swift" ]] && continue
+    source_files+=("$source")
+done
+test_files=("$app_dir"/Tests/*.swift)
+
 swiftc \
   -parse-as-library \
-  "$app_dir/Sources/SourceIdentity.swift" \
-  "$app_dir/Sources/LabelModels.swift" \
-  "$app_dir/Sources/Models.swift" \
-  "$app_dir/Sources/PhotoScanner.swift" \
-  "$app_dir/Sources/CatalogStore.swift" \
-  "$app_dir/Sources/FileTransfer.swift" \
-  "$app_dir/Tests/TestRunner.swift" \
+  "${source_files[@]}" \
+  "${test_files[@]}" \
   -o "$test_dir/PhotokichinTests" \
+  -framework SwiftUI \
   -framework AppKit \
   -framework ImageIO \
+  -framework ImageCaptureCore \
+  -framework DiskArbitration \
   -framework UniformTypeIdentifiers \
   -lsqlite3 \
+  -D PHOTOKICHIN_TESTING \
   -O
 
 "$test_dir/PhotokichinTests"

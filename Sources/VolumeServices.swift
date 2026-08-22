@@ -9,7 +9,8 @@ final class VolumeMonitor: ObservableObject {
     var onUnmount: ((URL) -> Void)?
     private var observers: [NSObjectProtocol] = []
 
-    init() {
+    init(startMonitoring: Bool = true) {
+        guard startMonitoring else { return }
         refresh()
         let workspace = NSWorkspace.shared.notificationCenter
         observers.append(workspace.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] _ in

@@ -200,7 +200,11 @@ final class MetadataLoadingCoordinator {
 
         if let request = active[observation.groupID], request.id == observation.requestID {
             request.observers.removeValue(forKey: observationID)
-            request.task?.cancel()
+            // A keyed request may be shared by several tiles. Cancelling one
+            // tile must not stop the read needed by the other observers.
+            if request.observers.isEmpty {
+                request.task?.cancel()
+            }
         } else if let index = queued.firstIndex(where: { $0.id == observation.requestID }) {
             let request = queued[index]
             request.observers.removeValue(forKey: observationID)

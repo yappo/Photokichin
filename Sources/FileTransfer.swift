@@ -28,6 +28,13 @@ final class FileTransferService {
     static let shared = FileTransferService()
     private init() {}
 
+#if PHOTOKICHIN_TESTING
+    /// Replaces the OS copy operation only in the deterministic test binary.
+    /// The application build does not compile this seam, so its normal copy
+    /// path and performance are unchanged.
+    static var testCopyFileAll: ((URL, URL, ImportCancellationToken?) throws -> Bool)?
+#endif
+
     final class AirDropSession: NSObject, NSSharingServiceDelegate {
         let service: NSSharingService
         private let completion: (Error?) -> Void
@@ -556,6 +563,11 @@ final class FileTransferService {
         cancellation: ImportCancellationToken?,
         preferClone: Bool = false
     ) throws -> Bool {
+#if PHOTOKICHIN_TESTING
+        if let testCopyFileAll = Self.testCopyFileAll {
+            return try testCopyFileAll(sourceURL, destinationURL, cancellation)
+        }
+#endif
         try cancellation?.check()
         let state = copyfile_state_alloc()
         guard let state else {

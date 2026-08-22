@@ -330,13 +330,213 @@ struct CameraDescriptor: Identifiable, Hashable, Sendable {
     }
 }
 
+/// The values needed to build a camera catalog, separated from the live
+/// ImageCaptureCore objects.  ICCameraFile is kept in CameraMonitor, while
+/// these values can be used by deterministic tests and catalog construction.
+struct CameraCatalogAsset: Hashable, Sendable {
+    let identifier: String
+    let filename: String
+    let remotePath: String
+    let variant: AssetVariant
+    let fileSize: Int64
+    let captureDate: Date?
+    let width: Int
+    let height: Int
+}
+
+struct CameraCatalogEntry: Hashable, Sendable {
+    let asset: CameraCatalogAsset
+    let pairedRaw: CameraCatalogAsset?
+}
+
+enum CameraCatalogRefreshDecision: Equatable {
+    case accepted
+    case ignored(String)
+}
+
+/// Pure part of the leading-edge catalog refresh gate.  The clock and the
+/// catalog update remain owned by CameraMonitor; this type only decides
+/// whether a received notification is allowed to start an update.
+struct CameraCatalogRefreshGate {
+    static let interval: TimeInterval = 5
+
+    static func decision(
+        receivedAt: Date,
+        completionEventAt: Date?,
+        updateInFlight: Bool,
+        updateStartedAt: Date?,
+        updateFinishedAt: Date?,
+        nextAllowedAt: Date?
+    ) -> CameraCatalogRefreshDecision {
+        if let completionEventAt, receivedAt <= completionEventAt {
+            return .ignored("before_completion_event")
+        }
+        if updateInFlight,
+           let updateStartedAt,
+           receivedAt >= updateStartedAt {
+            return .ignored("catalog_update_in_flight")
+        }
+        if let updateStartedAt,
+           let updateFinishedAt,
+           receivedAt >= updateStartedAt,
+           receivedAt <= updateFinishedAt {
+            return .ignored("catalog_update_in_flight")
+        }
+        if let nextAllowedAt, receivedAt < nextAllowedAt {
+            return .ignored("five_second_interval")
+        }
+        return .accepted
+    }
+}
+
+/// Builds the complete catalog snapshot from values read from
+/// ImageCaptureCore.  It deliberately replaces the previous snapshot: a
+/// group absent from the current camera input is not carried forward.
+enum CameraCatalogBuilder {
+    static func variant(for filename: String) -> AssetVariant? {
+        switch URL(fileURLWithPath: filename).pathExtension.lowercased() {
+        case "jpg", "jpeg": return .jpeg
+        case "cr3": return .raw
+        case "mov", "mp4": return .movie
+        default: return nil
+        }
+    }
+
+    static func groups(
+        cameraID: String,
+        cameraName: String?,
+        entries: [CameraCatalogEntry],
+        previousGroups: [PhotoGroup]
+    ) -> [PhotoGroup] {
+        var uniqueEntries: [CameraCatalogEntry] = []
+        var indexByIdentifier: [String: Int] = [:]
+        for entry in entries {
+            if let index = indexByIdentifier[entry.asset.identifier] {
+                // Duplicate notifications for one asset must not create a
+                // second asset, but a later notification may carry the
+                // paired RAW relation that the first one did not carry.
+                if uniqueEntries[index].pairedRaw == nil, let pairedRaw = entry.pairedRaw {
+                    uniqueEntries[index] = CameraCatalogEntry(
+                        asset: uniqueEntries[index].asset,
+                        pairedRaw: pairedRaw
+                    )
+                }
+                continue
+            }
+            indexByIdentifier[entry.asset.identifier] = uniqueEntries.count
+            uniqueEntries.append(entry)
+        }
+
+        var allAssets: [CameraCatalogAsset] = uniqueEntries.map(\.asset)
+        var knownIdentifiers = Set(allAssets.map(\.identifier))
+        for entry in uniqueEntries {
+            if let pairedRaw = entry.pairedRaw,
+               knownIdentifiers.insert(pairedRaw.identifier).inserted {
+                allAssets.append(pairedRaw)
+            }
+        }
+
+        var pairedGroupKeys: [String: String] = [:]
+        for entry in uniqueEntries {
+            guard entry.asset.variant == .jpeg, let raw = entry.pairedRaw else { continue }
+            let groupKey = remotePathWithoutExtension(entry.asset.remotePath)
+            pairedGroupKeys[entry.asset.identifier] = groupKey
+            pairedGroupKeys[raw.identifier] = groupKey
+        }
+
+        let previousByID = Dictionary(uniqueKeysWithValues: previousGroups.map { ($0.id, $0) })
+        var groupsByKey: [String: PhotoGroup] = [:]
+        for asset in allAssets {
+            let groupKey = pairedGroupKeys[asset.identifier] ?? remotePathWithoutExtension(asset.remotePath)
+            let groupID = "camera:\(cameraID):\(groupKey)"
+            var group = groupsByKey[groupKey] ?? previousByID[groupID] ?? PhotoGroup(
+                id: groupID,
+                basename: URL(fileURLWithPath: groupKey).lastPathComponent,
+                directory: cameraDirectoryURL(cameraID: cameraID, remotePath: asset.remotePath),
+                jpegURL: nil,
+                rawURL: nil,
+                movieURL: nil,
+                captureDate: asset.captureDate,
+                metadata: PhotoMetadata(
+                    captureDate: asset.captureDate,
+                    cameraMake: nil,
+                    cameraModel: cameraName,
+                    lensModel: nil,
+                    focalLength: nil,
+                    aperture: nil,
+                    shutterSpeed: nil,
+                    iso: nil,
+                    exposureBias: nil,
+                    orientation: nil,
+                    gps: nil,
+                    firmware: nil,
+                    pixelWidth: asset.width > 0 ? asset.width : nil,
+                    pixelHeight: asset.height > 0 ? asset.height : nil
+                ),
+                importedJPEG: false,
+                importedRAW: false,
+                isMetadataLoaded: false,
+                cameraReference: CameraPhotoReference(cameraID: cameraID, groupKey: groupKey, assets: [])
+            )
+
+            let cameraAsset = CameraAssetReference(
+                identifier: asset.identifier,
+                filename: URL(fileURLWithPath: asset.filename).lastPathComponent,
+                variant: asset.variant,
+                fileSize: asset.fileSize,
+                captureDate: asset.captureDate
+            )
+            let existingAssets = group.cameraReference?.assets ?? []
+            var assets = existingAssets.filter { $0.variant != asset.variant }
+            assets.append(cameraAsset)
+            group.cameraReference = CameraPhotoReference(cameraID: cameraID, groupKey: groupKey, assets: assets)
+            if let date = asset.captureDate,
+               group.captureDate == nil || date < group.captureDate! {
+                group.captureDate = date
+                group.metadata.captureDate = date
+            }
+            groupsByKey[groupKey] = group
+        }
+
+        var result = groupsByKey.values.sorted {
+            let lhsDate = $0.captureDate ?? .distantFuture
+            let rhsDate = $1.captureDate ?? .distantFuture
+            if lhsDate != rhsDate { return lhsDate < rhsDate }
+            let basenameOrder = $0.basename.localizedStandardCompare($1.basename)
+            if basenameOrder != .orderedSame { return basenameOrder == .orderedAscending }
+            return $0.id < $1.id
+        }
+        for index in result.indices {
+            result[index].presentationOrder = index
+        }
+        return result
+    }
+
+    private static func remotePathWithoutExtension(_ path: String) -> String {
+        URL(fileURLWithPath: path).deletingPathExtension().path
+    }
+
+    private static func cameraDirectoryURL(cameraID: String, remotePath: String) -> URL {
+        let directoryComponents = URL(fileURLWithPath: remotePath)
+            .deletingLastPathComponent()
+            .pathComponents
+            .filter { $0 != "/" && !$0.isEmpty }
+        var result = URL(fileURLWithPath: "/__photokichin_camera__")
+            .appendingPathComponent(safePathComponent(cameraID), isDirectory: true)
+        for component in directoryComponents {
+            result.appendPathComponent(component, isDirectory: true)
+        }
+        return result
+    }
+}
+
 /// Owns the ImageCaptureCore browser and the live ICCameraFile objects. A
 /// camera is a PTP device, not a filesystem volume, so this is intentionally
 /// separate from VolumeMonitor and PhotoScanner.
 @MainActor
 final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, ICDeviceDelegate, ICCameraDeviceDelegate {
     static let shared = CameraMonitor()
-    private static let catalogRefreshInterval: TimeInterval = 5
+    private static let catalogRefreshInterval = CameraCatalogRefreshGate.interval
 
     @Published private(set) var cameras: [CameraDescriptor] = []
     private let browser = ICDeviceBrowser()
@@ -849,46 +1049,18 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             return
         }
 
-        if let completionEventAt = record.catalogCompletionEventAt,
-           receivedAt <= completionEventAt {
-            logIgnoredCatalogRefresh(
-                record: record,
-                kind: kind,
-                reason: "before_completion_event"
-            )
-            return
-        }
-
-        if record.catalogRefreshInFlight,
-           let startedAt = record.catalogUpdateStartedAt,
-           receivedAt >= startedAt {
-            logIgnoredCatalogRefresh(
-                record: record,
-                kind: kind,
-                reason: "catalog_update_in_flight"
-            )
-            return
-        }
-
-        if let startedAt = record.catalogUpdateStartedAt,
-           let finishedAt = record.catalogUpdateFinishedAt,
-           receivedAt >= startedAt,
-           receivedAt <= finishedAt {
-            logIgnoredCatalogRefresh(
-                record: record,
-                kind: kind,
-                reason: "catalog_update_in_flight"
-            )
-            return
-        }
-
-        if let nextAllowedAt = record.catalogRefreshNextAllowedAt,
-           receivedAt < nextAllowedAt {
-            logIgnoredCatalogRefresh(
-                record: record,
-                kind: kind,
-                reason: "five_second_interval"
-            )
+        switch CameraCatalogRefreshGate.decision(
+            receivedAt: receivedAt,
+            completionEventAt: record.catalogCompletionEventAt,
+            updateInFlight: record.catalogRefreshInFlight,
+            updateStartedAt: record.catalogUpdateStartedAt,
+            updateFinishedAt: record.catalogUpdateFinishedAt,
+            nextAllowedAt: record.catalogRefreshNextAllowedAt
+        ) {
+        case .accepted:
+            break
+        case let .ignored(reason):
+            logIgnoredCatalogRefresh(record: record, kind: kind, reason: reason)
             return
         }
 
@@ -954,95 +1126,57 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
             "camera_io catalog_update_input complete=\(isComplete ? 1 : 0, privacy: .public) media_files=\(files.count, privacy: .public) announced_file_bytes=\(announcedFileBytes, privacy: .public)"
         )
 
-        var pairedGroupKeys: [String: String] = [:]
-        for file in files {
-            guard let filename = file.originalFilename ?? file.name,
-                  variant(for: filename) == .jpeg,
-                  let raw = file.pairedRawImage,
-                  let rawFilename = raw.originalFilename ?? raw.name else { continue }
-            let jpegPath = remotePath(for: file, filename: filename)
-            let rawPath = remotePath(for: raw, filename: rawFilename)
-            let groupKey = remotePathWithoutExtension(jpegPath)
-            pairedGroupKeys[assetIdentifier(for: file, remotePath: jpegPath)] = groupKey
-            pairedGroupKeys[assetIdentifier(for: raw, remotePath: rawPath)] = groupKey
-        }
-
-        var groupsByKey: [String: PhotoGroup] = [:]
         var fileIndex: [String: ICCameraFile] = [:]
-        let previousGroups = Dictionary(uniqueKeysWithValues: record.groups.map { ($0.id, $0) })
-
         for file in files {
             guard let filename = file.originalFilename ?? file.name,
-                  let variant = variant(for: filename) else { continue }
+                  variant(for: filename) != nil else { continue }
             let remotePath = remotePath(for: file, filename: filename)
             let assetIdentifier = assetIdentifier(for: file, remotePath: remotePath)
-            let groupKey = pairedGroupKeys[assetIdentifier] ?? remotePathWithoutExtension(remotePath)
-            let asset = CameraAssetReference(
-                identifier: assetIdentifier,
-                filename: URL(fileURLWithPath: filename).lastPathComponent,
-                variant: variant,
-                fileSize: Int64(file.fileSize),
-                captureDate: file.creationDate as Date?
-            )
             fileIndex[assetIdentifier] = file
+        }
 
-            let groupID = "camera:\(id):\(groupKey)"
-            var group = groupsByKey[groupKey] ?? previousGroups[groupID] ?? PhotoGroup(
-                id: groupID,
-                basename: URL(fileURLWithPath: groupKey).lastPathComponent,
-                directory: cameraDirectoryURL(cameraID: id, remotePath: remotePath),
-                jpegURL: nil,
-                rawURL: nil,
-                movieURL: nil,
-                captureDate: asset.captureDate,
-                metadata: PhotoMetadata(
-                    captureDate: asset.captureDate,
-                    cameraMake: nil,
-                    cameraModel: camera.name,
-                    lensModel: nil,
-                    focalLength: nil,
-                    aperture: nil,
-                    shutterSpeed: nil,
-                    iso: nil,
-                    exposureBias: nil,
-                    orientation: nil,
-                    gps: nil,
-                    firmware: nil,
-                    pixelWidth: file.width > 0 ? file.width : nil,
-                    pixelHeight: file.height > 0 ? file.height : nil
-                ),
-                importedJPEG: false,
-                importedRAW: false,
-                isMetadataLoaded: false,
-                cameraReference: CameraPhotoReference(cameraID: id, groupKey: groupKey, assets: [])
+        let entries = files.compactMap { file -> CameraCatalogEntry? in
+            guard let filename = file.originalFilename ?? file.name,
+                  let assetVariant = variant(for: filename) else { return nil }
+            let assetRemotePath = remotePath(for: file, filename: filename)
+            let assetID = assetIdentifier(for: file, remotePath: assetRemotePath)
+            let asset = CameraCatalogAsset(
+                identifier: assetID,
+                filename: filename,
+                remotePath: assetRemotePath,
+                variant: assetVariant,
+                fileSize: Int64(file.fileSize),
+                captureDate: file.creationDate as Date?,
+                width: file.width,
+                height: file.height
             )
-
-            let existingAssets = group.cameraReference?.assets ?? []
-            var assets = existingAssets.filter { $0.variant != variant }
-            assets.append(asset)
-            group.cameraReference = CameraPhotoReference(cameraID: id, groupKey: groupKey, assets: assets)
-            if let date = asset.captureDate,
-               group.captureDate == nil || date < group.captureDate! {
-                group.captureDate = date
-                group.metadata.captureDate = date
+            let pairedRaw = file.pairedRawImage.flatMap { raw -> CameraCatalogAsset? in
+                guard let rawFilename = raw.originalFilename ?? raw.name,
+                      let rawVariant = variant(for: rawFilename) else { return nil }
+                let rawPath = self.remotePath(for: raw, filename: rawFilename)
+                return CameraCatalogAsset(
+                    identifier: assetIdentifier(for: raw, remotePath: rawPath),
+                    filename: rawFilename,
+                    remotePath: rawPath,
+                    variant: rawVariant,
+                    fileSize: Int64(raw.fileSize),
+                    captureDate: raw.creationDate as Date?,
+                    width: raw.width,
+                    height: raw.height
+                )
             }
-            groupsByKey[groupKey] = group
+            return CameraCatalogEntry(asset: asset, pairedRaw: pairedRaw)
         }
 
         // Each accepted trigger publishes a complete replacement snapshot.
-        // Recompute the order from the current catalog instead of preserving
-        // old slots or appending new groups after them.
-        var groups = groupsByKey.values.sorted {
-            let lhsDate = $0.captureDate ?? .distantFuture
-            let rhsDate = $1.captureDate ?? .distantFuture
-            if lhsDate != rhsDate { return lhsDate < rhsDate }
-            let basenameOrder = $0.basename.localizedStandardCompare($1.basename)
-            if basenameOrder != .orderedSame { return basenameOrder == .orderedAscending }
-            return $0.id < $1.id
-        }
-        for index in groups.indices {
-            groups[index].presentationOrder = index
-        }
+        // CameraCatalogBuilder also recomputes the stable order and removes
+        // groups absent from this current mediaFiles snapshot.
+        let groups = CameraCatalogBuilder.groups(
+            cameraID: id,
+            cameraName: camera.name,
+            entries: entries,
+            previousGroups: record.groups
+        )
         if isComplete {
             record.catalogProgressTask?.cancel()
             record.catalogProgressTask = nil
@@ -1205,12 +1339,7 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
     }
 
     private func variant(for filename: String) -> AssetVariant? {
-        switch URL(fileURLWithPath: filename).pathExtension.lowercased() {
-        case "jpg", "jpeg": return .jpeg
-        case "cr3": return .raw
-        case "mov", "mp4": return .movie
-        default: return nil
-        }
+        CameraCatalogBuilder.variant(for: filename)
     }
 
     private func remotePath(for file: ICCameraFile, filename: String) -> String {
@@ -1225,34 +1354,11 @@ final class CameraMonitor: NSObject, ObservableObject, ICDeviceBrowserDelegate, 
         return components.joined(separator: "/")
     }
 
-    private func remotePathWithoutExtension(_ path: String) -> String {
-        let url = URL(fileURLWithPath: path)
-        return url.deletingPathExtension().path
-    }
-
     private func assetIdentifier(for file: ICCameraFile, remotePath: String) -> String {
         if file.ptpObjectHandle != 0 {
             return "handle:\(file.ptpObjectHandle)"
         }
         return "path:\(remotePath)"
-    }
-
-    private func cameraDirectoryURL(cameraID: String, remotePath: String) -> URL {
-        let directoryComponents = URL(fileURLWithPath: remotePath)
-            .deletingLastPathComponent()
-            .pathComponents
-            .filter { $0 != "/" && !$0.isEmpty }
-        var result = URL(fileURLWithPath: "/__photokichin_camera__")
-            .appendingPathComponent(CameraMonitor.safePathComponent(cameraID), isDirectory: true)
-        for component in directoryComponents {
-            result.appendPathComponent(component, isDirectory: true)
-        }
-        return result
-    }
-
-    private static func safePathComponent(_ value: String) -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
-        return value.unicodeScalars.map { allowed.contains($0) ? String($0) : "_" }.joined()
     }
 }
 
