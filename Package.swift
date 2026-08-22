@@ -74,7 +74,6 @@ let package = Package(
             name: "PhotokichinPresentationTests",
             dependencies: [
                 "PhotokichinPresentation",
-                "PhotokichinInfrastructure",
                 "PhotokichinApplication",
                 "PhotokichinDomain"
             ]

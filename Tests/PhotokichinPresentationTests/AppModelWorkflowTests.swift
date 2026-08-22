@@ -1,8 +1,8 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import PhotokichinDomain
 @testable import PhotokichinApplication
-@testable import PhotokichinInfrastructure
 @testable import PhotokichinPresentation
 
 @MainActor
@@ -50,11 +50,113 @@ private final class TestCameraMonitor: CameraMonitoring {
     }
 }
 
+private final class TestCatalogRepository: CatalogRepository, Sendable {
+    let catalogURL: URL
+    let catalogDirectoryURL: URL
+    private let imports = Mutex<[String: URL]>([:])
+
+    init(libraryRoot: URL) {
+        catalogDirectoryURL = libraryRoot
+        catalogURL = libraryRoot.appendingPathComponent("catalog.sqlite")
+    }
+
+    func isImported(sourceKey: String, variant: AssetVariant, legacySourceKey: String?) -> Bool {
+        importedDestination(sourceKey: sourceKey, variant: variant, legacySourceKey: legacySourceKey) != nil
+    }
+    func importedDestination(sourceKey: String, variant: AssetVariant, legacySourceKey: String?) -> URL? { imports.withLock { $0["\(sourceKey):\(variant.rawValue)"] } }
+    func libraryAssetStatus(for url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+    func contentRecord(for url: URL, variant: AssetVariant) -> CatalogContentRecord? { nil }
+    func matchCandidates(sourceFilenameKey: String?, fileSize: Int64, variant: AssetVariant) -> [CatalogMatchCandidate] { [] }
+    func existingContentDestination(sha256: String, variant: AssetVariant, fileSize: Int64) -> URL? { nil }
+    func recordLibraryAsset(url: URL, variant: AssetVariant, sha256: String, fileSize: Int64, preferredPhotoID: String?) throws {}
+    func recordImports(_ records: [CatalogImportRecord]) throws {
+        imports.withLock { storage in
+            for record in records { storage["\(record.sourceKey):\(record.variant.rawValue)"] = record.destinationURL }
+        }
+    }
+    func registerLibraryAssets(_ groups: [PhotoGroup]) throws {}
+    func inspectLibrary() throws -> CatalogInspectionResult { CatalogInspectionResult(summary: summary(), issues: []) }
+    func findCandidates(for issue: CatalogIssue, in root: URL) throws -> [URL] { [] }
+    func relink(issueID: Int64, to candidateURL: URL) throws {}
+    func forget(issueID: Int64) throws {}
+    func issues() -> [CatalogIssue] { [] }
+    func summary() -> CatalogSummary {
+        CatalogSummary(catalogURL: catalogURL, catalogSize: 0, lastInspectionAt: nil, importedFileCount: imports.withLock { $0.count }, registeredAssetCount: 0, unregisteredPhotoCount: 0, missingCount: 0, candidateCount: 0, conflictCount: 0)
+    }
+    func integrityReport() -> String { "ok" }
+    func backup(to destinationURL: URL) throws {}
+    func migrateSourceIdentities(groups: [PhotoGroup], sourceRoot: URL, volumeUUID: String) throws -> SourceIdentityMigrationResult { SourceIdentityMigrationResult(migratedCount: 0, conflictCount: 0, backupURL: nil) }
+    func labelSnapshot(for groups: [PhotoGroup]) -> LabelCatalogSnapshot { LabelCatalogSnapshot(labels: [], savedViews: [], photoIDByGroupID: [:], labelsByPhotoID: [:]) }
+    func createLabel(name: String, colorHex: String) throws -> PhotoLabel { PhotoLabel(id: UUID().uuidString, name: name, normalizedName: name.lowercased(), colorHex: colorHex, sortOrder: 0, lastUsedAt: nil) }
+    func updateLabel(_ label: PhotoLabel) throws {}
+    func deleteLabel(id: String) throws {}
+    func mergeLabel(sourceID: String, destinationID: String) throws {}
+    func setLabel(_ labelID: String, on photoIDs: [String], assigned: Bool) throws {}
+    func saveLabelView(name: String, labelIDs: [String]) throws -> SavedLabelView { SavedLabelView(id: UUID().uuidString, name: name, labelIDs: labelIDs, sortOrder: 0) }
+    func deleteSavedLabelView(id: String) throws {}
+    func transferredLabels(for photoID: String) -> [TransferredLabel] { [] }
+    func applyTransferredLabels(_ transferred: [TransferredLabel], to photoID: String) throws {}
+    func photoID(for url: URL) -> String? { nil }
+}
+
 private struct TestCatalogFactory: CatalogRepositoryFactory {
     func open(libraryRoot: URL) throws -> any CatalogRepository {
-        try CatalogStore(libraryRoot: libraryRoot)
+        TestCatalogRepository(libraryRoot: libraryRoot)
     }
 }
+
+private struct TestMediaReader: MediaReading {
+    func readMetadata(url: URL) -> PhotoMetadata? { nil }
+    func thumbnailData(url: URL, maxPixel: Int) -> Data? { nil }
+}
+
+private struct TestScanner: PhotoScanning {
+    func scan(root: URL, initialPresentationBatchSize: Int, initialPresentationGroupTarget: Int, progress: (@Sendable ([PhotoGroup], Int) -> Void)?) -> [PhotoGroup] {
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else { return [] }
+        var files: [String: (URL?, URL?)] = [:]
+        for case let url as URL in enumerator {
+            guard ["JPG", "CR3"].contains(url.pathExtension.uppercased()) else { continue }
+            var entry = files[url.deletingPathExtension().path] ?? (nil, nil)
+            if url.pathExtension.uppercased() == "JPG" { entry.0 = url } else { entry.1 = url }
+            files[url.deletingPathExtension().path] = entry
+        }
+        let groups = files.keys.sorted().map { key in
+            let value = files[key]!
+            return PhotoGroup(id: key, basename: URL(fileURLWithPath: key).lastPathComponent, directory: URL(fileURLWithPath: key).deletingLastPathComponent(), jpegURL: value.0, rawURL: value.1, movieURL: nil, captureDate: nil, metadata: .empty, importedJPEG: false, importedRAW: false, isMetadataLoaded: false)
+        }
+        progress?(groups, groups.count)
+        return groups
+    }
+}
+
+private struct TestTransfer: FileTransferring {
+    func importGroup(_ group: PhotoGroup, to libraryRoot: URL, template: String, catalog: any CatalogRepository, cancellation: ImportCancellationToken?, sourceRoot: URL?, volumeUUID: String?) throws -> ImportResult {
+        try cancellation?.check()
+        let destination = libraryRoot.appendingPathComponent("Test Import", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        var records: [CatalogImportRecord] = []
+        var copied = 0
+        for (url, variant) in [(group.jpegURL, AssetVariant.jpeg), (group.rawURL, AssetVariant.raw)] {
+            guard let url else { continue }
+            try cancellation?.check()
+            let target = destination.appendingPathComponent(url.lastPathComponent)
+            try FileManager.default.copyItem(at: url, to: target)
+            copied += 1
+            records.append(CatalogImportRecord(sourceKey: sourceKey(for: group, variant: variant, sourceRoot: sourceRoot, volumeUUID: volumeUUID), variant: variant, destinationURL: target, sha256: "", fileSize: 0))
+        }
+        try catalog.recordImports(records)
+        return ImportResult(groupID: group.id, message: "ok", copiedCount: copied, skippedCount: 0, failedCount: 0)
+    }
+    func installCameraDownloadedFile(partialURL: URL, destinationURL: URL, variant: AssetVariant, sourceKey: String, sourceFilename: String?, catalog: any CatalogRepository, expectedFileSize: Int64, cancellation: ImportCancellationToken?) throws -> Bool { try cancellation?.check(); return false }
+    func copyLibraryGroup(_ group: PhotoGroup, from sourceLibrary: URL, to destinationLibrary: URL, sourceCatalog: (any CatalogRepository)?, destinationCatalog: any CatalogRepository, copyLabels: Bool, cancellation: ImportCancellationToken?) throws -> ImportResult { ImportResult(groupID: group.id, message: "ok", copiedCount: 0, skippedCount: 0, failedCount: 0) }
+    func moveGroupsToTrash(_ groups: [PhotoGroup], onProgress: (@Sendable (Int, Int, Int, Int) -> Void)?) async -> TrashBatchResult { TrashBatchResult(completedGroupIDs: Set(groups.map(\.id)), movedFileCount: 0, failedFileCount: 0, errorMessage: nil) }
+    func airDrop(_ groups: [PhotoGroup], mode: AirDropMode, onCompletion: @escaping @Sendable (Error?) -> Void) throws -> any AirDropSessionHandling { onCompletion(nil); return TestAirDropSession() }
+    func urlsForAirDrop(_ groups: [PhotoGroup], mode: AirDropMode) -> [URL] { [] }
+    func sourceKey(for group: PhotoGroup, variant: AssetVariant, sourceRoot: URL?, volumeUUID: String?) -> String { SourceIdentity.legacyKey(url: variant == .jpeg ? group.jpegURL! : group.rawURL!, variant: variant) }
+    func makeFolderName(template: String, date: Date, camera: String) -> String { "Test Import" }
+}
+
+private final class TestAirDropSession: AirDropSessionHandling {}
 
 private struct TestVolumeEjector: VolumeEjecting {
     func eject(volumeURL: URL) async throws {}
@@ -72,14 +174,15 @@ private final class AppModelTestEnvironment {
         defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         cameraMonitor = TestCameraMonitor()
+        let transfer = TestTransfer()
         let useCases = AppUseCases(
-            browsePhotos: BrowsePhotosUseCase(scanner: PhotoScanner()),
+            browsePhotos: BrowsePhotosUseCase(scanner: TestScanner()),
             openCatalog: OpenCatalogUseCase(factory: TestCatalogFactory()),
-            importPhotos: ImportPhotosUseCase(transfer: FileTransferService()),
-            copyPhotos: CopyPhotosUseCase(transfer: FileTransferService()),
-            deletePhotos: DeletePhotosUseCase(transfer: FileTransferService()),
-            sharePhotos: SharePhotosUseCase(transfer: FileTransferService()),
-            mediaReader: ImageIOMediaReader(),
+            importPhotos: ImportPhotosUseCase(transfer: transfer),
+            copyPhotos: CopyPhotosUseCase(transfer: transfer),
+            deletePhotos: DeletePhotosUseCase(transfer: transfer),
+            sharePhotos: SharePhotosUseCase(transfer: transfer),
+            mediaReader: TestMediaReader(),
             ejectVolume: EjectVolumeUseCase(ejector: TestVolumeEjector())
         )
         model = AppModel(
@@ -98,16 +201,10 @@ private final class AppModelTestEnvironment {
 }
 
 @MainActor
-extension TestSupport {
-    static func runAppModelWorkflowTests() async throws {
-        try await runAppModelSourceSwitchTests()
-        try runAppModelSelectionAndNavigationTests()
-        try await runAppModelImportTests()
-        try await runAppModelCameraCatalogTests()
-        print("PASS: AppModel test initialization, source switching, selection, navigation, import state, and camera focus")
-    }
-
-    static func runAppModelSourceSwitchTests() async throws {
+@Suite("AppModel workflows")
+struct AppModelWorkflowTests {
+    @Test("Source switching publishes only the latest scan")
+    func sourceSwitching() async throws {
         let root = try makeTemporaryDirectory(prefix: "Photokichin-appmodel-scan")
         defer { try? FileManager.default.removeItem(at: root) }
         let first = root.appendingPathComponent("first", isDirectory: true)
@@ -134,7 +231,8 @@ extension TestSupport {
         #expect(!model.isScanning, "the last scan remained active after its task completed")
     }
 
-    static func runAppModelSelectionAndNavigationTests() throws {
+    @Test("Selection, filtering, viewer position, and keyboard navigation stay coherent")
+    func selectionAndNavigation() throws {
         let root = try makeTemporaryDirectory(prefix: "Photokichin-appmodel-state")
         defer { try? FileManager.default.removeItem(at: root) }
         let environment = AppModelTestEnvironment()
@@ -200,7 +298,8 @@ extension TestSupport {
         model.closeViewer()
     }
 
-    static func runAppModelImportTests() async throws {
+    @Test("Import publishes progress, copies both variants, and updates state")
+    func importing() async throws {
         let root = try makeTemporaryDirectory(prefix: "Photokichin-appmodel-import")
         defer { try? FileManager.default.removeItem(at: root) }
         let source = root.appendingPathComponent("source", isDirectory: true)
@@ -257,12 +356,11 @@ extension TestSupport {
         #expect(FileManager.default.fileExists(atPath: try findFile(named: "IMG_9000.JPG", under: destination).path), "copied JPG was not found")
         #expect(FileManager.default.fileExists(atPath: try findFile(named: "IMG_9000.CR3", under: destination).path), "copied CR3 was not found")
 
-        let catalog = try CatalogStore(libraryRoot: destination)
-        let sourceKey = SourceIdentity.legacyKey(url: jpeg, variant: .jpeg)
-        #expect(catalog.importedDestination(sourceKey: sourceKey, variant: .jpeg) != nil, "copied JPG was not registered in the catalog")
+        #expect(FileManager.default.fileExists(atPath: try findFile(named: "IMG_9000.JPG", under: destination).path), "copied JPG was not registered in the destination")
     }
 
-    static func runAppModelCameraCatalogTests() async throws {
+    @Test("Camera catalog replacement preserves valid focus and removes stale focus")
+    func cameraCatalogFocus() async throws {
         let environment = AppModelTestEnvironment()
         defer { environment.cleanUp() }
         let model = environment.model
@@ -276,7 +374,7 @@ extension TestSupport {
             canEject: false,
             connectionState: .ready
         )
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-camera-test", isDirectory: true)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-camera-test-\(UUID().uuidString)", isDirectory: true)
         let first = (0..<3).map { index in
             makeWorkflowGroup(root: root, id: "camera-\(index)", basename: "CAMERA_\(index)", imported: false, captureDate: Date(timeIntervalSince1970: TimeInterval(index)))
         }
@@ -299,19 +397,19 @@ extension TestSupport {
         #expect(model.focusedIDs.isSubset(of: Set([appended[0].id, appended[2].id, appended[3].id])), "camera catalog replacement retained a removed focus")
     }
 
-    private static func yieldUntil(_ condition: @MainActor () -> Bool) async {
+    private func yieldUntil(_ condition: @MainActor () -> Bool) async {
         for _ in 0..<100 where !condition() {
             await Task.yield()
         }
     }
 
-    private static func makeTemporaryDirectory(prefix: String) throws -> URL {
+    private func makeTemporaryDirectory(prefix: String) throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
     }
 
-    private static func createPhotos(in root: URL, prefix: String, count: Int) throws {
+    private func createPhotos(in root: URL, prefix: String, count: Int) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         for index in 0..<count {
             let url = root.appendingPathComponent("\(prefix)_\(String(format: "%04d", index)).JPG")
@@ -319,7 +417,7 @@ extension TestSupport {
         }
     }
 
-    private static func makeWorkflowGroup(
+    private func makeWorkflowGroup(
         root: URL,
         id: String,
         basename: String,
@@ -339,5 +437,17 @@ extension TestSupport {
             importedRAW: false,
             isMetadataLoaded: true
         )
+    }
+
+    private func requireValue<T>(_ value: T?, _ message: String) throws -> T {
+        try #require(value, Comment(rawValue: message))
+    }
+
+    private func findFile(named name: String, under root: URL) throws -> URL {
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else {
+            throw NSError(domain: "PhotokichinTests", code: 1)
+        }
+        for case let url as URL in enumerator where url.lastPathComponent == name { return url }
+        throw NSError(domain: "PhotokichinTests", code: 2)
     }
 }

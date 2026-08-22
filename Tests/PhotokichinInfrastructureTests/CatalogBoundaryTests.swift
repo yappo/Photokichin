@@ -4,24 +4,13 @@ import Testing
 @testable import PhotokichinDomain
 @testable import PhotokichinApplication
 @testable import PhotokichinInfrastructure
-@testable import PhotokichinPresentation
 
-extension TestSupport {
+@Suite("Catalog boundaries")
+struct CatalogBoundaryTests {
     /// Exercises CatalogStore's state boundaries through its public API.
-    ///
-    /// These tests deliberately use temporary libraries and ordinary files.
-    /// They do not inspect SQLite tables or private CatalogStore state, so a
-    /// catalog refactor must preserve the same observable results.
-    static func runCatalogBoundaryTests() throws {
-        try runRecordImportBoundaryTests()
-        try runInspectionBoundaryTests()
-        try runRelinkAndForgetBoundaryTests()
-        try runSourceIdentityMigrationBoundaryTests()
-        try runBackupFailureBoundaryTests()
-        print("PASS: catalog duplicate, rollback, inspection, relink, forget, migration, and backup boundaries")
-    }
-
-    static func runRecordImportBoundaryTests() throws {
+    /// These tests use temporary libraries and ordinary files only.
+    @Test("Import registration is unique and transactional")
+    func recordImportBoundary() throws {
         let root = temporaryRoot(named: "catalog-record-boundaries")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -97,7 +86,8 @@ extension TestSupport {
         )
     }
 
-    static func runInspectionBoundaryTests() throws {
+    @Test("Inspection reports missing, candidate, conflict, and unregistered files")
+    func inspectionBoundary() throws {
         let root = temporaryRoot(named: "catalog-inspection-boundaries")
         defer { try? FileManager.default.removeItem(at: root) }
         let imported = root.appendingPathComponent("imported", isDirectory: true)
@@ -156,7 +146,8 @@ extension TestSupport {
         )
     }
 
-    static func runRelinkAndForgetBoundaryTests() throws {
+    @Test("Relink accepts matching content and forget removes an issue")
+    func relinkAndForgetBoundary() throws {
         let root = temporaryRoot(named: "catalog-relink-boundaries")
         defer { try? FileManager.default.removeItem(at: root) }
         let imported = root.appendingPathComponent("imported", isDirectory: true)
@@ -216,7 +207,8 @@ extension TestSupport {
         #expect(!store.isImported(sourceKey: forgetKey, variant: .jpeg), "a forgotten record must not remain imported")
     }
 
-    static func runSourceIdentityMigrationBoundaryTests() throws {
+    @Test("Legacy source identities migrate with conflict handling")
+    func sourceIdentityMigrationBoundary() throws {
         let root = temporaryRoot(named: "catalog-source-migration-boundaries")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -278,7 +270,8 @@ extension TestSupport {
         #expect(!backupStore.isImported(sourceKey: successNew, variant: .jpeg), "the pre-migration backup must not contain the new source identity")
     }
 
-    static func runBackupFailureBoundaryTests() throws {
+    @Test("Backup failures preserve the source catalog")
+    func backupFailureBoundary() throws {
         let root = temporaryRoot(named: "catalog-backup-failure-boundaries")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -294,7 +287,73 @@ extension TestSupport {
         #expect(store.integrityReport() == "ok", "a failed backup must not damage the source catalog")
     }
 
-    private static func record(_ store: CatalogStore, sourceKey: String, destination: URL, data: Data) throws {
+    @Test("Filename identity drives candidate matching and verified camera reuse")
+    func filenameIdentityBoundary() throws {
+        let root = temporaryRoot(named: "catalog-filename-boundaries")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let imported = root.appendingPathComponent("imported/IMG_0001.JPG")
+        let library = root.appendingPathComponent("library/IMG_0001.JPG")
+        let contents = Data("same-camera-content".utf8)
+        try write(contents, to: imported)
+        try write(contents, to: library)
+
+        let store = try CatalogStore(libraryRoot: root)
+        let digest = try boundaryHash(imported)
+        try store.recordImport(
+            sourceKey: "camera:test:IMG_0001:JPG",
+            variant: .jpeg,
+            destinationURL: imported,
+            sha256: digest,
+            sourceFilename: "IMG_0001.JPG"
+        )
+        try store.recordLibraryAsset(
+            url: library,
+            variant: .jpeg,
+            sha256: digest,
+            fileSize: Int64(contents.count)
+        )
+
+        let candidates = store.matchCandidates(
+            sourceFilenameKey: "img_0001.jpg",
+            fileSize: Int64(contents.count),
+            variant: .jpeg
+        )
+        #expect(candidates.count == 2, "metadata-only candidate lookup must include imported and library records")
+        #expect(candidates.allSatisfy { $0.filenameKey == "img_0001.jpg" }, "candidate lookup must retain normalized filename keys")
+        #expect(
+            store.matchCandidates(sourceFilenameKey: "other.jpg", fileSize: Int64(contents.count), variant: .jpeg).isEmpty,
+            "candidate lookup must use the normalized filename key as well as size and variant"
+        )
+        #expect(
+            store.existingContentDestination(sha256: digest, variant: .jpeg, fileSize: Int64(contents.count)) != nil,
+            "a verified camera hash must find an existing library destination"
+        )
+        #expect(
+            store.existingContentDestination(sha256: digest, variant: .raw, fileSize: Int64(contents.count)) == nil,
+            "a matching hash with another variant must not be reused"
+        )
+
+        let partial = root.appendingPathComponent("camera/.photokichin-partial-test")
+        let cameraDestination = root.appendingPathComponent("camera/IMG_0001.JPG")
+        try FileManager.default.createDirectory(at: cameraDestination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try contents.write(to: partial)
+        let installed = try FileTransferService().installCameraDownloadedFile(
+            partialURL: partial,
+            destinationURL: cameraDestination,
+            variant: .jpeg,
+            sourceKey: "camera:test:IMG_0001:JPG",
+            sourceFilename: "IMG_0001.JPG",
+            catalog: store,
+            expectedFileSize: Int64(contents.count),
+            cancellation: nil
+        )
+        #expect(!installed, "camera import must reuse the verified existing file")
+        #expect(!FileManager.default.fileExists(atPath: cameraDestination.path), "camera reuse must not create a duplicate destination file")
+    }
+
+    private func record(_ store: CatalogStore, sourceKey: String, destination: URL, data: Data) throws {
         try write(data, to: destination)
         try store.recordImport(
             sourceKey: sourceKey,
@@ -305,7 +364,7 @@ extension TestSupport {
         )
     }
 
-    private static func migrationGroup(url: URL) -> PhotoGroup {
+    private func migrationGroup(url: URL) -> PhotoGroup {
         PhotoGroup(
             id: url.deletingPathExtension().path,
             basename: url.deletingPathExtension().lastPathComponent,
@@ -321,16 +380,16 @@ extension TestSupport {
         )
     }
 
-    private static func temporaryRoot(named name: String) -> URL {
+    private func temporaryRoot(named name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-\(name)-\(UUID().uuidString)", isDirectory: true)
     }
 
-    private static func write(_ data: Data, to url: URL) throws {
+    private func write(_ data: Data, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: url)
     }
 
-    private static func boundaryHash(_ url: URL) throws -> String {
+    private func boundaryHash(_ url: URL) throws -> String {
         SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
     }
 }
