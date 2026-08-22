@@ -18,7 +18,7 @@ struct PhotoScannerTests {
         try Data("raw".utf8).write(to: dcim.appendingPathComponent("IMG_0001.CR3"))
         try Data("ignored".utf8).write(to: management.appendingPathComponent("IMG_9999.JPG"))
 
-        let groups = PhotoScanner().scan(
+        let groups = InfrastructureTestSupport.scanner().scan(
             root: root,
             initialPresentationBatchSize: .max,
             initialPresentationGroupTarget: .max,
@@ -27,7 +27,7 @@ struct PhotoScannerTests {
 
         let group = try #require(groups.first)
         #expect(groups.count == 1)
-        #expect(group.variants == [.jpeg, .raw])
+        #expect(group.variants == [.renderedImage, .raw])
         #expect(!group.id.contains("CANONMSC"))
     }
 }

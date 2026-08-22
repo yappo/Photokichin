@@ -56,7 +56,7 @@ final class LibraryFeatureModel {
 final class FileOperationFeatureModel {
     var isBusy = false
     var operationProgress: OperationProgress?
-    var progressText = "SDカードまたはフォルダを選択してください"
+    var progressText = "SDカード、USBカメラ、または写真の入ったフォルダを選択してください"
     var errorMessage: String?
     var lastImportResults: [ImportResult] = []
     var importTemplate = "{date}_{camera}"

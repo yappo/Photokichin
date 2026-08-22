@@ -67,7 +67,7 @@ final class ThumbnailLoadingCoordinator {
         let requestID: UUID
     }
 
-    // ImageIO parallelizes one JPEG decode internally. Running a second
+    // ImageIO parallelizes one rendered-image decode internally. Running a second
     // request concurrently keeps the process around 130-150% CPU while a
     // library opens and delays AppKit input. One coordinator request at a
     // time still uses ImageIO's internal parallelism, while the priority queue

@@ -406,6 +406,6 @@ struct LoadingCoordinatorTests {
     }
 
     private func makeLoadingGroup(root: URL, id: String, path: String?, isMetadataLoaded: Bool = false, metadata: PhotoMetadata = .empty) -> PhotoGroup {
-        PhotoGroup(id: id, basename: path.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? id, directory: root, jpegURL: path.map { root.appendingPathComponent($0) }, rawURL: nil, movieURL: nil, captureDate: nil, metadata: metadata, importedJPEG: false, importedRAW: false, isMetadataLoaded: isMetadataLoaded)
+        PhotoGroup(id: id, basename: path.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? id, directory: root, renderedImageURL: path.map { root.appendingPathComponent($0) }, rawURL: nil, movieURL: nil, captureDate: nil, metadata: metadata, importedRenderedImage: false, importedRAW: false, isMetadataLoaded: isMetadataLoaded)
     }
 }

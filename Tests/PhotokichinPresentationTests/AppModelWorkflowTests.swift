@@ -122,7 +122,7 @@ private struct TestScanner: PhotoScanning {
         }
         let groups = files.keys.sorted().map { key in
             let value = files[key]!
-            return PhotoGroup(id: key, basename: URL(fileURLWithPath: key).lastPathComponent, directory: URL(fileURLWithPath: key).deletingLastPathComponent(), jpegURL: value.0, rawURL: value.1, movieURL: nil, captureDate: nil, metadata: .empty, importedJPEG: false, importedRAW: false, isMetadataLoaded: false)
+            return PhotoGroup(id: key, basename: URL(fileURLWithPath: key).lastPathComponent, directory: URL(fileURLWithPath: key).deletingLastPathComponent(), renderedImageURL: value.0, rawURL: value.1, movieURL: nil, captureDate: nil, metadata: .empty, importedRenderedImage: false, importedRAW: false, isMetadataLoaded: false)
         }
         progress?(groups, groups.count)
         return groups
@@ -136,7 +136,7 @@ private struct TestTransfer: FileTransferring {
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         var records: [CatalogImportRecord] = []
         var copied = 0
-        for (url, variant) in [(group.jpegURL, AssetVariant.jpeg), (group.rawURL, AssetVariant.raw)] {
+        for (url, variant) in [(group.renderedImageURL, AssetVariant.renderedImage), (group.rawURL, AssetVariant.raw)] {
             guard let url else { continue }
             try cancellation?.check()
             let target = destination.appendingPathComponent(url.lastPathComponent)
@@ -152,7 +152,7 @@ private struct TestTransfer: FileTransferring {
     func moveGroupsToTrash(_ groups: [PhotoGroup], onProgress: (@Sendable (Int, Int, Int, Int) -> Void)?) async -> TrashBatchResult { TrashBatchResult(completedGroupIDs: Set(groups.map(\.id)), movedFileCount: 0, failedFileCount: 0, errorMessage: nil) }
     func airDrop(_ groups: [PhotoGroup], mode: AirDropMode, onCompletion: @escaping @Sendable (Error?) -> Void) throws -> any AirDropSessionHandling { onCompletion(nil); return TestAirDropSession() }
     func urlsForAirDrop(_ groups: [PhotoGroup], mode: AirDropMode) -> [URL] { [] }
-    func sourceKey(for group: PhotoGroup, variant: AssetVariant, sourceRoot: URL?, volumeUUID: String?) -> String { SourceIdentity.legacyKey(url: variant == .jpeg ? group.jpegURL! : group.rawURL!, variant: variant) }
+    func sourceKey(for group: PhotoGroup, variant: AssetVariant, sourceRoot: URL?, volumeUUID: String?) -> String { SourceIdentity.legacyKey(url: variant == .renderedImage ? group.renderedImageURL! : group.rawURL!, variant: variant) }
     func makeFolderName(template: String, date: Date, camera: String) -> String { "Test Import" }
 }
 
@@ -328,12 +328,12 @@ struct AppModelWorkflowTests {
             id: source.appendingPathComponent("IMG_9000").path,
             basename: "IMG_9000",
             directory: source,
-            jpegURL: jpeg,
+            renderedImageURL: jpeg,
             rawURL: raw,
             movieURL: nil,
             captureDate: Date(timeIntervalSince1970: 1_700_000_000),
             metadata: .empty,
-            importedJPEG: false,
+            importedRenderedImage: false,
             importedRAW: false,
             isMetadataLoaded: true
         )
@@ -428,12 +428,12 @@ struct AppModelWorkflowTests {
             id: id,
             basename: basename,
             directory: root,
-            jpegURL: root.appendingPathComponent("\(basename).JPG"),
+            renderedImageURL: root.appendingPathComponent("\(basename).JPG"),
             rawURL: nil,
             movieURL: nil,
             captureDate: captureDate,
             metadata: .empty,
-            importedJPEG: imported,
+            importedRenderedImage: imported,
             importedRAW: false,
             isMetadataLoaded: true
         )

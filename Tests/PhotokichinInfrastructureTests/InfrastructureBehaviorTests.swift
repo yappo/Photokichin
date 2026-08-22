@@ -10,7 +10,8 @@ struct InfrastructureBehaviorTests {
 
     @Test("ImageIO metadata parser reads camera properties")
     func metadataParser() throws {
-        let cameraMetadata = ImageIOReader.readMetadata(properties: [
+        let reader = ImageIOMediaReader(pipeline: InfrastructureTestSupport.metadataPipeline)
+        let cameraMetadata = reader.readMetadata(properties: [
             "{Exif}": [
                 "LensModel": "RF24-70mm F2.8 L IS USM",
                 "FocalLength": 50.0,
@@ -23,7 +24,7 @@ struct InfrastructureBehaviorTests {
                 "Make": "Canon",
                 "Model": "Canon EOS R5m2"
             ]
-        ])
+        ], filename: "IMG_0001.CR3")
         #expect(cameraMetadata?.lensModel == "RF24-70mm F2.8 L IS USM", "camera metadata parser must expose the lens")
         #expect(cameraMetadata?.aperture != nil, "camera metadata parser must expose the aperture")
         #expect(cameraMetadata?.shutterSpeed != nil, "camera metadata parser must expose the shutter speed")
@@ -38,21 +39,21 @@ struct InfrastructureBehaviorTests {
         defer { try? FileManager.default.removeItem(at: libraryRoot) }
         try FileManager.default.createDirectory(at: libraryRoot, withIntermediateDirectories: true)
 
-        let jpegURL = libraryRoot.appendingPathComponent("IMG_0001.JPG")
+        let renderedImageURL = libraryRoot.appendingPathComponent("IMG_0001.JPG")
         let rawURL = libraryRoot.appendingPathComponent("IMG_0001.CR3")
-        try Data("library-jpeg".utf8).write(to: jpegURL)
+        try Data("library-jpeg".utf8).write(to: renderedImageURL)
         try Data("library-raw".utf8).write(to: rawURL)
 
-        let groups = PhotoScanner.scan(root: libraryRoot)
+        let groups = InfrastructureTestSupport.scan(root: libraryRoot)
         guard let group = groups.first else {
             throw NSError(domain: "PhotokichinTests", code: 20, userInfo: [NSLocalizedDescriptionKey: "temporary library photo was not scanned"])
         }
         let transfer = FileTransferService()
-        let both = transfer.urlsForAirDrop([group], mode: .jpegAndRaw)
-        let expectedPaths = Set([jpegURL, rawURL].map(\.standardizedFileURL.path))
-        #expect(Set(both.map(\.standardizedFileURL.path)) == expectedPaths, "library JPG＋CR3 AirDrop must use the library file URLs")
-        #expect(transfer.urlsForAirDrop([group], mode: .jpegOnly).map(\.standardizedFileURL.path) == [jpegURL.standardizedFileURL.path], "library JPG-only AirDrop must use the library JPG URL")
-        #expect(transfer.urlsForAirDrop([group], mode: .rawOnly).map(\.standardizedFileURL.path) == [rawURL.standardizedFileURL.path], "library CR3-only AirDrop must use the library CR3 URL")
+        let both = transfer.urlsForAirDrop([group], mode: .renderedAndRaw)
+        let expectedPaths = [renderedImageURL, rawURL].map(\.standardizedFileURL.path)
+        #expect(both.map { $0.standardizedFileURL.path } == expectedPaths, "library rendered-image＋RAW AirDrop must preserve URL order")
+        #expect(transfer.urlsForAirDrop([group], mode: .renderedOnly).map { $0.standardizedFileURL.path } == [renderedImageURL.standardizedFileURL.path], "library JPG-only AirDrop must use the library JPG URL")
+        #expect(transfer.urlsForAirDrop([group], mode: .rawOnly).map { $0.standardizedFileURL.path } == [rawURL.standardizedFileURL.path], "library CR3-only AirDrop must use the library CR3 URL")
         #expect(both.allSatisfy { FileManager.default.isReadableFile(atPath: $0.path) }, "library AirDrop URLs must be readable files")
     }
 
@@ -72,9 +73,9 @@ struct InfrastructureBehaviorTests {
         let destination = importedFolder.appendingPathComponent("IMG_0001.JPG")
         try FileManager.default.copyItem(at: source, to: destination)
 
-        let store = try CatalogStore(libraryRoot: root)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
         let sourceKey = "/Volumes/EOS_DIGITAL/DCIM/100EOS_R/IMG_0001:JPG"
-        try store.recordImport(sourceKey: sourceKey, variant: .jpeg, destinationURL: destination, sha256: hash(source))
+        try store.recordImport(sourceKey: sourceKey, variant: .renderedImage, destinationURL: destination, sha256: hash(source))
         let unregistered = root.appendingPathComponent("IMG_0002.JPG")
         try Data("unregistered".utf8).write(to: unregistered)
 
@@ -88,7 +89,7 @@ struct InfrastructureBehaviorTests {
             throw NSError(domain: "PhotokichinTests", code: 21, userInfo: [NSLocalizedDescriptionKey: "moved file candidate was not detected"])
         }
         try store.relink(issueID: issue.id, to: candidate)
-        #expect(store.importedDestination(sourceKey: sourceKey, variant: .jpeg)?.standardizedFileURL == candidate.standardizedFileURL, "relink did not update destination")
+        #expect(store.importedDestination(sourceKey: sourceKey, variant: .renderedImage)?.standardizedFileURL == candidate.standardizedFileURL, "relink did not update destination")
 
         let backup = root.deletingLastPathComponent().appendingPathComponent("Photokichin-catalog-backup-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: backup) }
@@ -117,17 +118,17 @@ struct InfrastructureBehaviorTests {
             id: sourceFolder.appendingPathComponent("IMG_0001").path,
             basename: "IMG_0001",
             directory: sourceFolder,
-            jpegURL: jpeg,
+            renderedImageURL: jpeg,
             rawURL: raw,
             movieURL: nil,
             captureDate: Date(timeIntervalSince1970: 0),
             metadata: .empty,
-            importedJPEG: true,
+            importedRenderedImage: true,
             importedRAW: true,
             isMetadataLoaded: true
         )
-        let sourceCatalog = try CatalogStore(libraryRoot: sourceRoot)
-        let targetCatalog = try CatalogStore(libraryRoot: targetRoot)
+        let sourceCatalog = try InfrastructureTestSupport.catalogStore(libraryRoot: sourceRoot)
+        let targetCatalog = try InfrastructureTestSupport.catalogStore(libraryRoot: targetRoot)
         let result = try FileTransferService().copyLibraryGroup(
             group,
             from: sourceRoot,
@@ -171,12 +172,12 @@ struct InfrastructureBehaviorTests {
         let sourcePhotoID = UUID().uuidString
         var group = PhotoGroup(
             id: jpeg.deletingPathExtension().path, basename: "IMG_0100", directory: sourceFolder,
-            jpegURL: jpeg, rawURL: raw, movieURL: nil, captureDate: Date(), metadata: .empty,
-            importedJPEG: true, importedRAW: true, isMetadataLoaded: true, libraryAssetStatus: .registered,
+            renderedImageURL: jpeg, rawURL: raw, movieURL: nil, captureDate: Date(), metadata: .empty,
+            importedRenderedImage: true, importedRAW: true, isMetadataLoaded: true, libraryAssetStatus: .registered,
             photoID: sourcePhotoID
         )
-        let sourceCatalog = try CatalogStore(libraryRoot: sourceRoot)
-        try sourceCatalog.recordLibraryAsset(url: jpeg, variant: .jpeg, sha256: hash(jpeg), fileSize: Int64(Data("label-jpg".utf8).count), preferredPhotoID: sourcePhotoID)
+        let sourceCatalog = try InfrastructureTestSupport.catalogStore(libraryRoot: sourceRoot)
+        try sourceCatalog.recordLibraryAsset(url: jpeg, variant: .renderedImage, sha256: hash(jpeg), fileSize: Int64(Data("label-jpg".utf8).count), preferredPhotoID: sourcePhotoID)
         try sourceCatalog.recordLibraryAsset(url: raw, variant: .raw, sha256: hash(raw), fileSize: Int64(Data("label-raw".utf8).count), preferredPhotoID: sourcePhotoID)
         let travel = try sourceCatalog.createLabel(name: "旅行", colorHex: "#0091FF")
         let existingSource = try sourceCatalog.createLabel(name: "家族", colorHex: "#E5484D")
@@ -185,7 +186,7 @@ struct InfrastructureBehaviorTests {
         _ = try sourceCatalog.saveLabelView(name: "旅行と家族", labelIDs: [travel.id, existingSource.id])
         group.labels = [travel, existingSource]
 
-        let destinationCatalog = try CatalogStore(libraryRoot: destinationRoot)
+        let destinationCatalog = try InfrastructureTestSupport.catalogStore(libraryRoot: destinationRoot)
         let existingDestination = try destinationCatalog.createLabel(name: "家族", colorHex: "#46A758")
         let copied = try FileTransferService().copyLibraryGroup(
             group, from: sourceRoot, to: destinationRoot,
@@ -197,8 +198,8 @@ struct InfrastructureBehaviorTests {
         #expect(destinationPhotoID == sourcePhotoID, "a new library copy must preserve the photo UUID")
         let destinationSnapshot = destinationCatalog.labelSnapshot(for: [PhotoGroup(
             id: copiedJPG.deletingPathExtension().path, basename: "IMG_0100", directory: copiedJPG.deletingLastPathComponent(),
-            jpegURL: copiedJPG, rawURL: destinationRoot.appendingPathComponent("2026-08-13_Canon EOS R/IMG_0100.CR3"), movieURL: nil,
-            captureDate: nil, metadata: .empty, importedJPEG: true, importedRAW: true, isMetadataLoaded: true
+            renderedImageURL: copiedJPG, rawURL: destinationRoot.appendingPathComponent("2026-08-13_Canon EOS R/IMG_0100.CR3"), movieURL: nil,
+            captureDate: nil, metadata: .empty, importedRenderedImage: true, importedRAW: true, isMetadataLoaded: true
         )])
         let destinationTravel = try requireValue(destinationSnapshot.labels.first(where: { $0.normalizedName == normalizedLabelName("旅行") }), "copied label is missing")
         #expect(destinationTravel.id != travel.id, "a source label UUID must never be written to the destination")
@@ -207,7 +208,7 @@ struct InfrastructureBehaviorTests {
         #expect(destinationFamily.colorHex == "#46A758", "the destination label color must be preserved")
         #expect(destinationSnapshot.savedViews.isEmpty, "saved label views must not be copied")
 
-        let noLabelsCatalog = try CatalogStore(libraryRoot: noLabelsRoot)
+        let noLabelsCatalog = try InfrastructureTestSupport.catalogStore(libraryRoot: noLabelsRoot)
         let noLabelsResult = try FileTransferService().copyLibraryGroup(
             group, from: sourceRoot, to: noLabelsRoot,
             sourceCatalog: sourceCatalog, destinationCatalog: noLabelsCatalog, copyLabels: false
@@ -216,8 +217,8 @@ struct InfrastructureBehaviorTests {
         let noLabelsJPG = noLabelsRoot.appendingPathComponent("2026-08-13_Canon EOS R/IMG_0100.JPG")
         let noLabelsSnapshot = noLabelsCatalog.labelSnapshot(for: [PhotoGroup(
             id: noLabelsJPG.deletingPathExtension().path, basename: "IMG_0100", directory: noLabelsJPG.deletingLastPathComponent(),
-            jpegURL: noLabelsJPG, rawURL: nil, movieURL: nil, captureDate: nil, metadata: .empty,
-            importedJPEG: true, importedRAW: false, isMetadataLoaded: true
+            renderedImageURL: noLabelsJPG, rawURL: nil, movieURL: nil, captureDate: nil, metadata: .empty,
+            importedRenderedImage: true, importedRAW: false, isMetadataLoaded: true
         )])
         #expect(noLabelsSnapshot.labels.isEmpty, "label tables must remain unchanged when label copy is disabled")
         print("PASS: labels, saved views, destination-local label UUIDs, and label-copy boundary")

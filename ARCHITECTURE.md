@@ -13,7 +13,7 @@ PhotokichinApp
 
 ### PhotokichinDomain
 
-写真、JPG／CR3の組、取り込み状態、ラベル、カメラの値型スナップショット、ソース識別などを置きます。UI、ファイルシステム、SQLite、Appleフレームワークをimportしません。値は原則`Sendable`にします。
+写真、rendered image／RAW／movieというsemantic role、取り込み状態、ラベル、カメラの値型スナップショット、ソース識別などを置きます。`AssetVariant`のrawValueである`JPG`、`CR3`、`動画`は、SQLiteとSourceIdentityの既存データを読むための互換契約であり、ユーザー向けの形式分類ではありません。UI、ファイルシステム、SQLite、Appleフレームワークをimportしません。値は原則`Sendable`にします。
 
 ### PhotokichinApplication
 
@@ -24,6 +24,10 @@ PhotokichinApp
 ### PhotokichinInfrastructure
 
 Applicationのポートを実装します。SQLiteカタログ、ファイル探索と安全な転送、ImageIO、ImageCaptureCore、Disk Arbitration、AirDropの実装を置きます。`ICCameraDevice`、`ICCameraFile`、SQLiteハンドルはこのモジュールの外へ渡しません。
+
+形式とカメラ差分はInfrastructureのcontributionとして分離します。`MediaFormatRegistry`は拡張子からsemantic roleを解決し、`CameraSupportDefinition`は形式、ファイルシステム探索rule、metadata enricher、camera matcherを一つの薄い値として提供します。productionには`GenericMediaSupport`と`CanonCameraSupport`を明示登録します。`FilesystemTraversalPolicy`は登録されたruleを順に評価し、`MetadataEnrichmentPipeline`は標準ImageIO値を保ったままvendor補完の失敗を隔離します。`CameraIdentity`とmatcher／resolverはImageCaptureCoreが報告した値だけからsupport identifierを解決し、能力やI/Oの分岐は上書きしません。
+
+production compositionは`InfrastructureFactory`で一度だけ構成します。同じclassifierをカード、USBカメラ、ライブラリ検査へ注入し、同じmetadata pipelineをURL経路とUSB経路へ渡します。consumerはclassifier、traversal policy、resolver、reader、pipelineなどの狭い依存だけを受け取り、global singleton、service locator、runtime plugin、DI frameworkは使いません。vendor固有の拡張子、管理directory、MakerNoteキーは各contributionの中だけに置きます。
 
 ### PhotokichinPresentation
 

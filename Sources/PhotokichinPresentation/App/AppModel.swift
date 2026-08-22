@@ -1285,7 +1285,7 @@ package final class AppModel {
             return transfer.sourceKey(for: $0, variant: issue.variant, sourceRoot: sourceURL, volumeUUID: sourceVolume?.volumeUUID) == issue.sourceKey ||
                 SourceIdentity.legacyKey(url: url, variant: issue.variant) == issue.sourceKey
         }) else {
-            errorMessage = "元のSDカードまたはフォルダを開いてから再コピーしてください。"
+            errorMessage = "元のSDカードまたは写真の入ったフォルダを開いてから再コピーしてください。"
             return
         }
         guard !isBusy else { return }
@@ -1386,7 +1386,7 @@ package final class AppModel {
             let volumeUUID = self.sourceVolume?.volumeUUID
             let operationToken = currentScanToken
             let totalImportFiles = groupsToImport.reduce(0) { count, group in
-                count + [group.jpegURL, group.rawURL].compactMap { $0 }.count
+                count + [group.renderedImageURL, group.rawURL].compactMap { $0 }.count
             }
             operationProgress = OperationProgress(
                 title: "取り込み中",
@@ -1437,7 +1437,7 @@ package final class AppModel {
                         results.append(result)
                         completed += 1
                         let completedGroup = groupsToImport.first(where: { $0.id == result.groupID })
-                        completedFiles += [completedGroup?.jpegURL, completedGroup?.rawURL].compactMap { $0 }.count
+                        completedFiles += [completedGroup?.renderedImageURL, completedGroup?.rawURL].compactMap { $0 }.count
                         let basename = completedGroup?.basename ?? result.groupID
                         self.operationProgress = OperationProgress(
                             title: "取り込み中",
@@ -1586,7 +1586,7 @@ package final class AppModel {
         let folderName = useCases.importPhotos.folderName(
             template: template,
             date: date,
-            camera: group.metadata.cameraModel ?? "EOS R"
+            camera: group.metadata.cameraModel ?? "Camera"
         )
         let destinationDirectory = destination.appendingPathComponent(folderName, isDirectory: true)
         do {
@@ -1662,7 +1662,7 @@ package final class AppModel {
     private func markCameraGroupImported(_ groupID: String) {
         guard let index = groupIndexByID[groupID] else { return }
         var updated = groups[index]
-        if updated.importableVariants.contains(.jpeg) { updated.importedJPEG = true }
+        if updated.importableVariants.contains(.renderedImage) { updated.importedRenderedImage = true }
         if updated.importableVariants.contains(.raw) { updated.importedRAW = true }
         groups[index] = updated
         rebuildGroupedPhotos()
@@ -1694,7 +1694,7 @@ package final class AppModel {
             let copyLabels = copyLabelsOnLibraryCopy
             let operationToken = currentScanToken
             let totalFiles = groupsToCopy.reduce(0) { count, group in
-                count + [group.jpegURL, group.rawURL].compactMap { $0 }.count
+                count + [group.renderedImageURL, group.rawURL].compactMap { $0 }.count
             }
             isBusy = true
             operationProgress = OperationProgress(
@@ -1747,7 +1747,7 @@ package final class AppModel {
                         results.append(result)
                         completed += 1
                         let completedGroup = groupsToCopy.first(where: { $0.id == result.groupID })
-                        completedFiles += [completedGroup?.jpegURL, completedGroup?.rawURL].compactMap { $0 }.count
+                        completedFiles += [completedGroup?.renderedImageURL, completedGroup?.rawURL].compactMap { $0 }.count
                         self.operationProgress = OperationProgress(
                             title: "ライブラリへコピー中",
                             completedGroups: completed,
@@ -1813,7 +1813,7 @@ package final class AppModel {
         let operationToken = currentScanToken
         isBusy = true
         let fileCount = groupsToDelete.reduce(0) { count, group in
-            count + [group.jpegURL, group.rawURL].compactMap { $0 }.count
+            count + [group.renderedImageURL, group.rawURL].compactMap { $0 }.count
         }
         operationProgress = OperationProgress(
             title: "ゴミ箱へ移動中",
@@ -1920,7 +1920,9 @@ package final class AppModel {
                     } catch {
                         groupFailed = true
                         failedFiles += 1
-                        failureMessages.append("\(group.basename) \(variant.rawValue): \(error.localizedDescription)")
+                        let filename = group.url(for: variant)?.lastPathComponent
+                            ?? group.cameraReference?.asset(for: variant)?.filename
+                        failureMessages.append("\(group.basename) \(variant.displayName(filename: filename)): \(error.localizedDescription)")
                     }
                     processedFiles += 1
                     self.operationProgress = OperationProgress(
@@ -2385,9 +2387,9 @@ package final class AppModel {
             for enrichedGroup in enriched {
                 guard let index = self.groupIndexByID[enrichedGroup.id] else { continue }
                 var current = self.groupByID[enrichedGroup.id] ?? merged[index]
-                current.importedJPEG = enrichedGroup.importedJPEG
+                current.importedRenderedImage = enrichedGroup.importedRenderedImage
                 current.importedRAW = enrichedGroup.importedRAW
-                current.possibleImportedJPEG = enrichedGroup.possibleImportedJPEG
+                current.possibleImportedRenderedImage = enrichedGroup.possibleImportedRenderedImage
                 current.possibleImportedRAW = enrichedGroup.possibleImportedRAW
                 current.libraryAssetStatus = enrichedGroup.libraryAssetStatus
                 merged[index] = current
@@ -2424,24 +2426,24 @@ package final class AppModel {
         var updated = group
         if group.isCameraBacked {
             updated.libraryAssetStatus = .notApplicable
-            updated.importedJPEG = false
+            updated.importedRenderedImage = false
             updated.importedRAW = false
-            updated.possibleImportedJPEG = false
+            updated.possibleImportedRenderedImage = false
             updated.possibleImportedRAW = false
             guard let catalog = targetCatalog,
                   let reference = group.cameraReference else { return updated }
-            if let asset = reference.asset(for: .jpeg) {
+            if let asset = reference.asset(for: .renderedImage) {
                 let sourceKey = CameraSourceLocation.catalogKey(
                     cameraID: reference.cameraID,
                     groupKey: reference.groupKey,
-                    variant: .jpeg
+                    variant: .renderedImage
                 )
-                updated.importedJPEG = catalog.isImported(sourceKey: sourceKey, variant: .jpeg, legacySourceKey: nil)
-                if !updated.importedJPEG {
-                    updated.possibleImportedJPEG = !catalog.matchCandidates(
+                updated.importedRenderedImage = catalog.isImported(sourceKey: sourceKey, variant: .renderedImage, legacySourceKey: nil)
+                if !updated.importedRenderedImage {
+                    updated.possibleImportedRenderedImage = !catalog.matchCandidates(
                         sourceFilenameKey: FilenameIdentity.key(for: asset.filename),
                         fileSize: asset.fileSize,
-                        variant: .jpeg
+                        variant: .renderedImage
                     ).isEmpty
                 }
             }
@@ -2466,10 +2468,10 @@ package final class AppModel {
             // EXT is a property of the source library itself. Import state,
             // including the green checkmark, is a property of the target
             // library and must be checked at the target's corresponding path.
-            let jpegSourceManaged = group.jpegURL.map { catalog?.libraryAssetStatus(for: $0) ?? false } ?? false
+            let renderedImageSourceManaged = group.renderedImageURL.map { catalog?.libraryAssetStatus(for: $0) ?? false } ?? false
             let rawSourceManaged = group.rawURL.map { catalog?.libraryAssetStatus(for: $0) ?? false } ?? false
-            let jpegTargetManaged = targetURL(
-                for: group.jpegURL,
+            let renderedImageTargetManaged = targetURL(
+                for: group.renderedImageURL,
                 sourceRoot: sourceRoot,
                 targetRoot: targetRoot,
                 catalog: targetCatalog
@@ -2480,25 +2482,25 @@ package final class AppModel {
                 targetRoot: targetRoot,
                 catalog: targetCatalog
             )
-            let available = [group.jpegURL, group.rawURL].compactMap { $0 }.count
-            let sourceManaged = [jpegSourceManaged, rawSourceManaged].filter { $0 }.count
-            updated.importedJPEG = jpegTargetManaged
+            let available = [group.renderedImageURL, group.rawURL].compactMap { $0 }.count
+            let sourceManaged = [renderedImageSourceManaged, rawSourceManaged].filter { $0 }.count
+            updated.importedRenderedImage = renderedImageTargetManaged
             updated.importedRAW = rawTargetManaged
-            updated.possibleImportedJPEG = false
+            updated.possibleImportedRenderedImage = false
             updated.possibleImportedRAW = false
             updated.libraryAssetStatus = sourceManaged == 0 ? .unregistered : (sourceManaged == available ? .registered : .partial)
             return updated
         }
         updated.libraryAssetStatus = .notApplicable
-        updated.importedJPEG = false
+        updated.importedRenderedImage = false
         updated.importedRAW = false
-        updated.possibleImportedJPEG = false
+        updated.possibleImportedRenderedImage = false
         updated.possibleImportedRAW = false
         guard let catalog else { return updated }
-        if let jpegURL = group.jpegURL {
-            let sourceKey = SourceIdentity.key(url: jpegURL, variant: .jpeg, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
-            let legacyKey = SourceIdentity.legacyKey(url: jpegURL, variant: .jpeg)
-            updated.importedJPEG = catalog.isImported(sourceKey: sourceKey, variant: .jpeg, legacySourceKey: legacyKey)
+        if let renderedImageURL = group.renderedImageURL {
+            let sourceKey = SourceIdentity.key(url: renderedImageURL, variant: .renderedImage, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
+            let legacyKey = SourceIdentity.legacyKey(url: renderedImageURL, variant: .renderedImage)
+            updated.importedRenderedImage = catalog.isImported(sourceKey: sourceKey, variant: .renderedImage, legacySourceKey: legacyKey)
         }
         if let rawURL = group.rawURL {
             let sourceKey = SourceIdentity.key(url: rawURL, variant: .raw, sourceRoot: sourceRoot, volumeUUID: volumeUUID)

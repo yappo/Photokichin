@@ -528,7 +528,7 @@ struct ApplicationUseCaseTests {
         let root = URL(fileURLWithPath: "/tmp/source-key-root")
         let result = ImportPhotosUseCase(transfer: transfer).sourceKey(
             for: group,
-            variant: .jpeg,
+            variant: .renderedImage,
             sourceRoot: root,
             volumeUUID: "volume-source-key"
         )
@@ -536,7 +536,7 @@ struct ApplicationUseCaseTests {
         let call = transfer.sourceKeyCalls.first
         #expect(result == "source-key")
         #expect(call?.groupID == group.id)
-        #expect(call?.variant == .jpeg)
+        #expect(call?.variant == .renderedImage)
         #expect(call?.sourceRoot == root)
         #expect(call?.volumeUUID == "volume-source-key")
     }
@@ -619,11 +619,11 @@ struct ApplicationUseCaseTests {
         let transfer = TransferSpy()
         let groups = [makeGroup(id: "share-one"), makeGroup(id: "share-two")]
         let completion = ProgressRecorder()
-        let session = try SharePhotosUseCase(transfer: transfer).execute(groups, mode: .jpegOnly) { completion.recordCompletion($0) }
+        let session = try SharePhotosUseCase(transfer: transfer).execute(groups, mode: .renderedOnly) { completion.recordCompletion($0) }
 
         let call = try #require(transfer.shareCalls.first)
         #expect(call.groupIDs == groups.map(\.id))
-        #expect(call.mode == .jpegOnly)
+        #expect(call.mode == .renderedOnly)
         #expect(session is AirDropSpy)
         #expect(completion.completionSuccess == [true])
     }
@@ -660,12 +660,12 @@ struct ApplicationUseCaseTests {
             id: id,
             basename: "IMG_\(id)",
             directory: root,
-            jpegURL: root.appendingPathComponent("IMG_\(id).JPG"),
+            renderedImageURL: root.appendingPathComponent("IMG_\(id).JPG"),
             rawURL: nil,
             movieURL: nil,
             captureDate: nil,
             metadata: .empty,
-            importedJPEG: false,
+            importedRenderedImage: false,
             importedRAW: false,
             isMetadataLoaded: true
         )

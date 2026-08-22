@@ -66,7 +66,7 @@ final class FileTransferService: FileTransferring, Sendable {
     ) throws -> ImportResult {
         try cancellation?.check()
         let date = group.metadata.captureDate ?? group.captureDate ?? Date()
-        let camera = sanitizedFileComponent(group.metadata.cameraModel ?? "EOS R")
+        let camera = sanitizedFileComponent(group.metadata.cameraModel ?? "Camera")
         let folderName = makeFolderName(template: template, date: date, camera: camera)
         let destinationDirectory = libraryRoot.appendingPathComponent(folderName, isDirectory: true)
         try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
@@ -77,7 +77,7 @@ final class FileTransferService: FileTransferring, Sendable {
         var messages: [String] = []
         var catalogRecords: [CatalogImportRecord] = []
 
-        for (variant, sourceURL) in [(AssetVariant.jpeg, group.jpegURL), (AssetVariant.raw, group.rawURL)].compactMap({ variant, url in url.map { (variant, $0) } }) {
+        for (variant, sourceURL) in [(AssetVariant.renderedImage, group.renderedImageURL), (AssetVariant.raw, group.rawURL)].compactMap({ variant, url in url.map { (variant, $0) } }) {
             let destinationURL = destinationDirectory.appendingPathComponent(sourceURL.lastPathComponent)
             do {
                 try cancellation?.check()
@@ -250,7 +250,7 @@ final class FileTransferService: FileTransferring, Sendable {
             : destinationLibrary.appendingPathComponent(relativeDirectory, isDirectory: true)
         try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
 
-        let sourceURLForCapabilities = group.jpegURL ?? group.rawURL
+        let sourceURLForCapabilities = group.renderedImageURL ?? group.rawURL
         let capabilities = sourceURLForCapabilities.map {
             copyCapabilities(sourceURL: $0, destinationRoot: destinationLibrary)
         } ?? CopyCapabilities(sameVolume: false, supportsCloning: false)
@@ -264,7 +264,7 @@ final class FileTransferService: FileTransferring, Sendable {
         var cloneCount = 0
         var messages: [String] = []
 
-        for (variant, sourceURL) in [(AssetVariant.jpeg, group.jpegURL), (AssetVariant.raw, group.rawURL)].compactMap({ variant, url in url.map { (variant, $0) } }) {
+        for (variant, sourceURL) in [(AssetVariant.renderedImage, group.renderedImageURL), (AssetVariant.raw, group.rawURL)].compactMap({ variant, url in url.map { (variant, $0) } }) {
             let destinationURL = destinationDirectory.appendingPathComponent(sourceURL.lastPathComponent)
             do {
                 try cancellation?.check()
@@ -348,7 +348,7 @@ final class FileTransferService: FileTransferring, Sendable {
     }
 
     func moveGroupToTrash(_ group: PhotoGroup) throws {
-        let urls = [group.jpegURL, group.rawURL].compactMap { $0 }
+        let urls = [group.renderedImageURL, group.rawURL].compactMap { $0 }
         guard !urls.isEmpty else { throw AppError.noSelectedPhotos }
         for url in urls {
             do {
@@ -364,7 +364,7 @@ final class FileTransferService: FileTransferring, Sendable {
         onProgress: (@Sendable (Int, Int, Int, Int) -> Void)? = nil
     ) async -> TrashBatchResult {
         let totalFileCount = groups.reduce(0) { count, group in
-            count + [group.jpegURL, group.rawURL].compactMap { $0 }.count
+            count + [group.renderedImageURL, group.rawURL].compactMap { $0 }.count
         }
         guard totalFileCount > 0 else {
             return TrashBatchResult(completedGroupIDs: [], movedFileCount: 0, failedFileCount: 0, errorMessage: nil)
@@ -375,10 +375,10 @@ final class FileTransferService: FileTransferring, Sendable {
         var errorMessages: [String] = []
 
         // NSWorkspace reports only one completion for a recycle request. Recycle
-        // one JPG+CR3 group at a time so the UI can show real completed counts
+        // one rendered-image+RAW group at a time so the UI can show real completed counts
         // while still making one OS call instead of one call per file.
         for (index, group) in groups.enumerated() {
-            let groupURLs = [group.jpegURL, group.rawURL].compactMap { $0 }
+            let groupURLs = [group.renderedImageURL, group.rawURL].compactMap { $0 }
             if groupURLs.isEmpty {
                 errorMessages.append("\(group.basename): ゴミ箱へ移動できる写真ファイルがありません")
                 onProgress?(index + 1, groups.count, movedPaths.count, totalFileCount)
@@ -452,8 +452,8 @@ final class FileTransferService: FileTransferring, Sendable {
     func urlsForAirDrop(_ groups: [PhotoGroup], mode: AirDropMode) -> [URL] {
         groups.flatMap { group -> [URL] in
             switch mode {
-            case .jpegAndRaw: return [group.jpegURL, group.rawURL].compactMap { $0 }
-            case .jpegOnly: return [group.jpegURL].compactMap { $0 }
+            case .renderedAndRaw: return [group.renderedImageURL, group.rawURL].compactMap { $0 }
+            case .renderedOnly: return [group.renderedImageURL].compactMap { $0 }
             case .rawOnly: return [group.rawURL].compactMap { $0 }
             }
         }
@@ -467,7 +467,7 @@ final class FileTransferService: FileTransferring, Sendable {
     ) -> String {
         let url: URL?
         switch variant {
-        case .jpeg: url = group.jpegURL
+        case .renderedImage: url = group.renderedImageURL
         case .raw: url = group.rawURL
         case .movie: url = group.movieURL
         }

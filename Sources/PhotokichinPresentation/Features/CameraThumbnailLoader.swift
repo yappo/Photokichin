@@ -55,7 +55,7 @@ final class CameraThumbnailCoordinator {
         onImage: @escaping (NSImage?) -> Void
     ) -> UUID? {
         guard let reference = group.cameraReference,
-              let asset = reference.asset(for: .jpeg) ?? reference.asset(for: .raw) else {
+              let asset = reference.asset(for: .renderedImage) ?? reference.asset(for: .raw) else {
             onImage(nil)
             return nil
         }
@@ -135,7 +135,7 @@ final class CameraThumbnailCoordinator {
     ) {
         let desired: [(Key, PhotoGroup, ThumbnailRequestPriority)] = groups.compactMap { group, priority in
             guard let reference = group.cameraReference,
-                  let asset = reference.asset(for: .jpeg) ?? reference.asset(for: .raw) else { return nil }
+                  let asset = reference.asset(for: .renderedImage) ?? reference.asset(for: .raw) else { return nil }
             return (
                 Key(cameraID: reference.cameraID, assetIdentifier: asset.identifier, maxPixel: maxPixel),
                 group,
