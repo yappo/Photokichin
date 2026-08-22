@@ -79,7 +79,7 @@ final class MetadataLoadingCoordinator {
 
         let mediaReader = self.mediaReader
         let metadataLoader: @Sendable (TaskPriority) async -> PhotoMetadata? = loader ?? { taskPriority in
-            let urls = [group.jpegURL, group.rawURL].compactMap { $0 }
+            let urls = [group.renderedImageURL, group.rawURL].compactMap { $0 }
             return await Task.detached(priority: taskPriority) {
                 urls.lazy.compactMap { mediaReader.readMetadata(url: $0) }.first
             }.value

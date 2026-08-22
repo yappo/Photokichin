@@ -30,11 +30,57 @@ struct FileTransferImportTests {
         #expect(result.failedCount == 0)
         #expect(FileManager.default.fileExists(atPath: jpeg.path))
         #expect(FileManager.default.fileExists(atPath: raw.path))
-        try requireMatchingTimestamp(group.jpegURL!, jpeg, attribute: .creationDate, label: "JPG creation date")
-        try requireMatchingTimestamp(group.jpegURL!, jpeg, attribute: .modificationDate, label: "JPG modification date")
+        try requireMatchingTimestamp(group.renderedImageURL!, jpeg, attribute: .creationDate, label: "JPG creation date")
+        try requireMatchingTimestamp(group.renderedImageURL!, jpeg, attribute: .modificationDate, label: "JPG modification date")
         try requireMatchingTimestamp(group.rawURL!, raw, attribute: .creationDate, label: "CR3 creation date")
         try requireMatchingTimestamp(group.rawURL!, raw, attribute: .modificationDate, label: "CR3 modification date")
         try requireNoPartialFiles(under: destination)
+    }
+
+    @Test("Import uses Camera as the fallback folder and preserves a reported camera model")
+    func importFolderFallbackUsesGenericCameraName() throws {
+        let fixture = try makeFixture(prefix: "camera-folder-fallback")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let captureDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let fallbackGroup = try makeImportGroup(
+            sourceRoot: fixture.source.appendingPathComponent("fallback"),
+            basename: "IMG_FALLBACK",
+            jpegData: Data("fallback".utf8),
+            rawData: nil,
+            captureDate: captureDate
+        )
+        _ = try fixture.transfer.importGroup(
+            fallbackGroup,
+            to: fixture.library,
+            template: "{date}_{camera}",
+            catalog: fixture.catalog
+        )
+        let fallbackDirectory = fixture.library.appendingPathComponent(
+            fixture.transfer.makeFolderName(template: "{date}_{camera}", date: captureDate, camera: "Camera"),
+            isDirectory: true
+        )
+        #expect(FileManager.default.fileExists(atPath: fallbackDirectory.appendingPathComponent("IMG_FALLBACK.JPG").path))
+
+        var namedGroup = try makeImportGroup(
+            sourceRoot: fixture.source.appendingPathComponent("named"),
+            basename: "IMG_NAMED",
+            jpegData: Data("named".utf8),
+            rawData: nil,
+            captureDate: captureDate
+        )
+        namedGroup.metadata.cameraModel = "Nikon Z"
+        _ = try fixture.transfer.importGroup(
+            namedGroup,
+            to: fixture.library,
+            template: "{date}_{camera}",
+            catalog: fixture.catalog
+        )
+        let namedDirectory = fixture.library.appendingPathComponent(
+            fixture.transfer.makeFolderName(template: "{date}_{camera}", date: captureDate, camera: "Nikon Z"),
+            isDirectory: true
+        )
+        #expect(FileManager.default.fileExists(atPath: namedDirectory.appendingPathComponent("IMG_NAMED.JPG").path))
     }
 
     @Test("Successful JPG and CR3 import registers both source identities")
@@ -44,7 +90,7 @@ struct FileTransferImportTests {
         let group = try makeImportGroup(sourceRoot: fixture.source.appendingPathComponent("pair"), basename: "IMG_0002", jpegData: Data("jpg".utf8), rawData: Data("raw".utf8), captureDate: Date(timeIntervalSince1970: 1_700_000_000))
         _ = try fixture.transfer.importGroup(group, to: fixture.library, template: "{date}_{camera}", catalog: fixture.catalog)
         let destination = libraryDirectory(for: group, under: fixture.library, transfer: fixture.transfer)
-        try requireCatalogRecord(fixture.catalog, transfer: fixture.transfer, group: group, variant: .jpeg, destination: destination.appendingPathComponent("IMG_0002.JPG"), source: group.jpegURL!)
+        try requireCatalogRecord(fixture.catalog, transfer: fixture.transfer, group: group, variant: .renderedImage, destination: destination.appendingPathComponent("IMG_0002.JPG"), source: group.renderedImageURL!)
         try requireCatalogRecord(fixture.catalog, transfer: fixture.transfer, group: group, variant: .raw, destination: destination.appendingPathComponent("IMG_0002.CR3"), source: group.rawURL!)
     }
 
@@ -82,7 +128,7 @@ struct FileTransferImportTests {
         #expect(result.failedCount == 1)
         #expect(try Data(contentsOf: destination) == Data("original".utf8))
         try requireNoPartialFiles(under: destination.deletingLastPathComponent())
-        #expect(fixture.catalog.importedDestination(sourceKey: fixture.transfer.sourceKey(for: conflict, variant: .jpeg), variant: .jpeg) == nil)
+        #expect(fixture.catalog.importedDestination(sourceKey: fixture.transfer.sourceKey(for: conflict, variant: .renderedImage), variant: .renderedImage) == nil)
     }
 
     @Test("JPG-only import copies one file and leaves no partial file")
@@ -99,9 +145,9 @@ struct FileTransferImportTests {
             fixture.catalog,
             transfer: fixture.transfer,
             group: group,
-            variant: .jpeg,
+            variant: .renderedImage,
             destination: destinationURL,
-            source: group.jpegURL!
+            source: group.renderedImageURL!
         )
         try requireNoPartialFiles(under: destination)
     }
@@ -132,12 +178,12 @@ struct FileTransferImportTests {
         let fixture = try makeFixture(prefix: "missing-source")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let sourceRoot = fixture.source.appendingPathComponent("missing")
-        let group = PhotoGroup(id: sourceRoot.appendingPathComponent("IMG_0007").path, basename: "IMG_0007", directory: sourceRoot, jpegURL: sourceRoot.appendingPathComponent("IMG_0007.JPG"), rawURL: sourceRoot.appendingPathComponent("IMG_0007.CR3"), movieURL: nil, captureDate: Date(timeIntervalSince1970: 1_700_259_200), metadata: .empty, importedJPEG: false, importedRAW: false, isMetadataLoaded: true)
+        let group = PhotoGroup(id: sourceRoot.appendingPathComponent("IMG_0007").path, basename: "IMG_0007", directory: sourceRoot, renderedImageURL: sourceRoot.appendingPathComponent("IMG_0007.JPG"), rawURL: sourceRoot.appendingPathComponent("IMG_0007.CR3"), movieURL: nil, captureDate: Date(timeIntervalSince1970: 1_700_259_200), metadata: .empty, importedRenderedImage: false, importedRAW: false, isMetadataLoaded: true)
         let result = try fixture.transfer.importGroup(group, to: fixture.library, template: "{date}_{camera}", catalog: fixture.catalog)
         #expect(result.copiedCount == 0)
         #expect(result.failedCount == 2)
         try requireNoPartialFiles(under: fixture.library)
-        #expect(fixture.catalog.importedDestination(sourceKey: fixture.transfer.sourceKey(for: group, variant: .jpeg), variant: .jpeg) == nil)
+        #expect(fixture.catalog.importedDestination(sourceKey: fixture.transfer.sourceKey(for: group, variant: .renderedImage), variant: .renderedImage) == nil)
         #expect(fixture.catalog.importedDestination(sourceKey: fixture.transfer.sourceKey(for: group, variant: .raw), variant: .raw) == nil)
     }
 
@@ -152,7 +198,7 @@ struct FileTransferImportTests {
         let destination = libraryDirectory(for: group, under: fixture.library, transfer: fixture.transfer)
         #expect(!FileManager.default.fileExists(atPath: destination.path))
         try requireNoPartialFiles(under: fixture.library)
-        #expect(fixture.catalog.importedDestination(sourceKey: fixture.transfer.sourceKey(for: group, variant: .jpeg), variant: .jpeg) == nil)
+        #expect(fixture.catalog.importedDestination(sourceKey: fixture.transfer.sourceKey(for: group, variant: .renderedImage), variant: .renderedImage) == nil)
     }
 
     @Test("Interrupted copy removes the completed destination and both catalog records")
@@ -171,7 +217,7 @@ struct FileTransferImportTests {
         let destination = libraryDirectory(for: group, under: fixture.library, transfer: transfer)
         #expect(!FileManager.default.fileExists(atPath: destination.appendingPathComponent("IMG_0009.JPG").path))
         try requireNoPartialFiles(under: destination)
-        #expect(fixture.catalog.importedDestination(sourceKey: transfer.sourceKey(for: group, variant: .jpeg), variant: .jpeg) == nil)
+        #expect(fixture.catalog.importedDestination(sourceKey: transfer.sourceKey(for: group, variant: .renderedImage), variant: .renderedImage) == nil)
         #expect(fixture.catalog.importedDestination(sourceKey: transfer.sourceKey(for: group, variant: .raw), variant: .raw) == nil)
     }
 
@@ -182,7 +228,7 @@ struct FileTransferImportTests {
         let management = fixture.source.appendingPathComponent("CANONMSC", isDirectory: true)
         try FileManager.default.createDirectory(at: management, withIntermediateDirectories: true)
         try Data("canon-management-file".utf8).write(to: management.appendingPathComponent("IMG_9999.JPG"))
-        let groups = PhotoScanner.scan(root: fixture.source)
+        let groups = InfrastructureTestSupport.scan(root: fixture.source)
         #expect(groups.allSatisfy { !$0.id.contains("CANONMSC") })
     }
 
@@ -192,27 +238,27 @@ struct FileTransferImportTests {
         let library = root.appendingPathComponent("library", isDirectory: true)
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
-        return Fixture(root: root, source: source, library: library, catalog: try CatalogStore(libraryRoot: library), transfer: FileTransferService())
+        return Fixture(root: root, source: source, library: library, catalog: try InfrastructureTestSupport.catalogStore(libraryRoot: library), transfer: FileTransferService())
     }
 
     private func makeImportGroup(sourceRoot: URL, basename: String, jpegData: Data?, rawData: Data?, captureDate: Date) throws -> PhotoGroup {
         try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
-        let jpegURL = jpegData.map { _ in sourceRoot.appendingPathComponent("\(basename).JPG") }
+        let renderedImageURL = jpegData.map { _ in sourceRoot.appendingPathComponent("\(basename).JPG") }
         let rawURL = rawData.map { _ in sourceRoot.appendingPathComponent("\(basename).CR3") }
-        if let jpegData, let jpegURL {
-            try jpegData.write(to: jpegURL)
-            try setTestTimestamps(jpegURL, creationDate: captureDate, modificationDate: captureDate.addingTimeInterval(7))
+        if let jpegData, let renderedImageURL {
+            try jpegData.write(to: renderedImageURL)
+            try setTestTimestamps(renderedImageURL, creationDate: captureDate, modificationDate: captureDate.addingTimeInterval(7))
         }
         if let rawData, let rawURL {
             try rawData.write(to: rawURL)
             try setTestTimestamps(rawURL, creationDate: captureDate, modificationDate: captureDate.addingTimeInterval(11))
         }
-        return PhotoGroup(id: sourceRoot.appendingPathComponent(basename).path, basename: basename, directory: sourceRoot, jpegURL: jpegURL, rawURL: rawURL, movieURL: nil, captureDate: captureDate, metadata: .empty, importedJPEG: false, importedRAW: false, isMetadataLoaded: true)
+        return PhotoGroup(id: sourceRoot.appendingPathComponent(basename).path, basename: basename, directory: sourceRoot, renderedImageURL: renderedImageURL, rawURL: rawURL, movieURL: nil, captureDate: captureDate, metadata: .empty, importedRenderedImage: false, importedRAW: false, isMetadataLoaded: true)
     }
 
     private func libraryDirectory(for group: PhotoGroup, under libraryRoot: URL, transfer: FileTransferService) -> URL {
         let date = group.metadata.captureDate ?? group.captureDate ?? Date()
-        let camera = group.metadata.cameraModel ?? "EOS R"
+        let camera = group.metadata.cameraModel ?? "Camera"
         return libraryRoot.appendingPathComponent(transfer.makeFolderName(template: "{date}_{camera}", date: date, camera: camera), isDirectory: true)
     }
 

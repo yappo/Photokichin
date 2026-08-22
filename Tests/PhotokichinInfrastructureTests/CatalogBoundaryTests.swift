@@ -14,7 +14,7 @@ struct CatalogBoundaryTests {
         let root = temporaryRoot(named: "catalog-record-boundaries")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let store = try CatalogStore(libraryRoot: root)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
 
         let first = root.appendingPathComponent("first/IMG_0001.JPG")
         let second = root.appendingPathComponent("second/IMG_0001.JPG")
@@ -24,24 +24,24 @@ struct CatalogBoundaryTests {
 
         try store.recordImport(
             sourceKey: sourceKey,
-            variant: .jpeg,
+            variant: .renderedImage,
             destinationURL: first,
             sha256: boundaryHash(first),
             sourceFilename: "IMG_0001.JPG"
         )
         try store.recordImport(
             sourceKey: sourceKey,
-            variant: .jpeg,
+            variant: .renderedImage,
             destinationURL: second,
             sha256: boundaryHash(second),
             sourceFilename: "IMG_0001.JPG"
         )
         #expect(store.summary().importedFileCount == 1, "re-registering one source and variant must not create a duplicate")
         #expect(
-            store.importedDestination(sourceKey: sourceKey, variant: .jpeg)?.standardizedFileURL == second.standardizedFileURL,
+            store.importedDestination(sourceKey: sourceKey, variant: .renderedImage)?.standardizedFileURL == second.standardizedFileURL,
             "re-registering one source and variant must update its destination"
         )
-        #expect(store.isImported(sourceKey: sourceKey, variant: .jpeg), "updated import must remain imported")
+        #expect(store.isImported(sourceKey: sourceKey, variant: .renderedImage), "updated import must remain imported")
 
         let rollbackRoot = root.appendingPathComponent("rollback")
         try FileManager.default.createDirectory(at: rollbackRoot, withIntermediateDirectories: true)
@@ -55,7 +55,7 @@ struct CatalogBoundaryTests {
             try store.recordImports([
                 CatalogImportRecord(
                     sourceKey: "volume:camera-boundary:DCIM/100EOS_R/IMG_VALID:JPG",
-                    variant: .jpeg,
+                    variant: .renderedImage,
                     destinationURL: valid,
                     sha256: boundaryHash(valid),
                     fileSize: Int64(Data("valid-record".utf8).count)
@@ -64,7 +64,7 @@ struct CatalogBoundaryTests {
                 // after the first row has been prepared and roll back both.
                 CatalogImportRecord(
                     sourceKey: "volume:camera-boundary:DCIM/100EOS_R/IMG_INVALID:JPG",
-                    variant: .jpeg,
+                    variant: .renderedImage,
                     destinationURL: outside,
                     sha256: String(repeating: "0", count: 64),
                     fileSize: 1
@@ -77,11 +77,11 @@ struct CatalogBoundaryTests {
         }
         #expect(store.summary().importedFileCount == before, "recordImports must roll back every row after a later row fails")
         #expect(
-            store.importedDestination(sourceKey: "volume:camera-boundary:DCIM/100EOS_R/IMG_VALID:JPG", variant: .jpeg) == nil,
+            store.importedDestination(sourceKey: "volume:camera-boundary:DCIM/100EOS_R/IMG_VALID:JPG", variant: .renderedImage) == nil,
             "a record before a failed recordImports row must not remain"
         )
         #expect(
-            store.importedDestination(sourceKey: "volume:camera-boundary:DCIM/100EOS_R/IMG_INVALID:JPG", variant: .jpeg) == nil,
+            store.importedDestination(sourceKey: "volume:camera-boundary:DCIM/100EOS_R/IMG_INVALID:JPG", variant: .renderedImage) == nil,
             "a failed recordImports row must not be registered"
         )
     }
@@ -96,7 +96,7 @@ struct CatalogBoundaryTests {
         try FileManager.default.createDirectory(at: imported, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: recovered, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: extra, withIntermediateDirectories: true)
-        let store = try CatalogStore(libraryRoot: root)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
 
         let missing = imported.appendingPathComponent("IMG_MISSING.JPG")
         let missingData = Data("missing-data".utf8)
@@ -156,7 +156,7 @@ struct CatalogBoundaryTests {
         try FileManager.default.createDirectory(at: imported, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: recovered, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: wrong, withIntermediateDirectories: true)
-        let store = try CatalogStore(libraryRoot: root)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
 
         let relinkPath = imported.appendingPathComponent("IMG_RELINK.JPG")
         let relinkKey = "volume:relink:DCIM/100EOS_R/IMG_RELINK:JPG"
@@ -190,21 +190,21 @@ struct CatalogBoundaryTests {
             "a rejected relink candidate must leave the issue open"
         )
         #expect(
-            store.importedDestination(sourceKey: relinkKey, variant: .jpeg)?.standardizedFileURL == relinkPath.standardizedFileURL,
+            store.importedDestination(sourceKey: relinkKey, variant: .renderedImage)?.standardizedFileURL == relinkPath.standardizedFileURL,
             "a rejected relink candidate must not change the recorded destination"
         )
 
         try store.relink(issueID: relinkIssue.id, to: correctCandidate)
         #expect(
-            store.importedDestination(sourceKey: relinkKey, variant: .jpeg)?.standardizedFileURL == correctCandidate.standardizedFileURL,
+            store.importedDestination(sourceKey: relinkKey, variant: .renderedImage)?.standardizedFileURL == correctCandidate.standardizedFileURL,
             "relink must accept the candidate whose SHA-256 matches the record"
         )
         #expect(!store.issues().contains { $0.id == relinkIssue.id }, "a successful relink must resolve its issue")
 
         try store.forget(issueID: forgetIssue.id)
         #expect(!store.issues().contains { $0.id == forgetIssue.id }, "forget must remove the issue")
-        #expect(store.importedDestination(sourceKey: forgetKey, variant: .jpeg) == nil, "forget must remove the imported record")
-        #expect(!store.isImported(sourceKey: forgetKey, variant: .jpeg), "a forgotten record must not remain imported")
+        #expect(store.importedDestination(sourceKey: forgetKey, variant: .renderedImage) == nil, "forget must remove the imported record")
+        #expect(!store.isImported(sourceKey: forgetKey, variant: .renderedImage), "a forgotten record must not remain imported")
     }
 
     @Test("Legacy source identities migrate with conflict handling")
@@ -217,13 +217,13 @@ struct CatalogBoundaryTests {
         let successSource = sourceRoot.appendingPathComponent("DCIM/100EOS_R/IMG_SUCCESS.JPG")
         let conflictSource = sourceRoot.appendingPathComponent("DCIM/100EOS_R/IMG_CONFLICT.JPG")
         let otherCardSource = sourceRoot.appendingPathComponent("DCIM/100EOS_R/IMG_OTHER_CARD.JPG")
-        let successLegacy = SourceIdentity.legacyKey(url: successSource, variant: .jpeg)
-        let conflictLegacy = SourceIdentity.legacyKey(url: conflictSource, variant: .jpeg)
-        let otherCardLegacy = SourceIdentity.legacyKey(url: otherCardSource, variant: .jpeg)
-        let successNew = SourceIdentity.key(url: successSource, variant: .jpeg, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
-        let conflictNew = SourceIdentity.key(url: conflictSource, variant: .jpeg, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
+        let successLegacy = SourceIdentity.legacyKey(url: successSource, variant: .renderedImage)
+        let conflictLegacy = SourceIdentity.legacyKey(url: conflictSource, variant: .renderedImage)
+        let otherCardLegacy = SourceIdentity.legacyKey(url: otherCardSource, variant: .renderedImage)
+        let successNew = SourceIdentity.key(url: successSource, variant: .renderedImage, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
+        let conflictNew = SourceIdentity.key(url: conflictSource, variant: .renderedImage, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
 
-        let store = try CatalogStore(libraryRoot: root)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
         let successDestination = root.appendingPathComponent("success/IMG_SUCCESS.JPG")
         let conflictLegacyDestination = root.appendingPathComponent("conflict-legacy/IMG_CONFLICT.JPG")
         let conflictNewDestination = root.appendingPathComponent("conflict-new/IMG_CONFLICT.JPG")
@@ -251,11 +251,11 @@ struct CatalogBoundaryTests {
         }
         #expect(FileManager.default.fileExists(atPath: backupURL.path), "source identity migration must create a pre-migration backup")
 
-        #expect(store.isImported(sourceKey: successNew, variant: .jpeg), "the scanned legacy row must be readable by its new source identity")
-        #expect(!store.isImported(sourceKey: successLegacy, variant: .jpeg), "the migrated row must no longer be readable by its legacy source identity")
-        #expect(store.isImported(sourceKey: conflictLegacy, variant: .jpeg), "a conflicting legacy row must remain unchanged")
-        #expect(store.isImported(sourceKey: otherCardLegacy, variant: .jpeg), "a legacy row absent from the current scan must remain unchanged")
-        #expect(!store.isImported(sourceKey: SourceIdentity.key(url: otherCardSource, variant: .jpeg, sourceRoot: sourceRoot, volumeUUID: volumeUUID), variant: .jpeg), "migration must not guess another card's row from its filename")
+        #expect(store.isImported(sourceKey: successNew, variant: .renderedImage), "the scanned legacy row must be readable by its new source identity")
+        #expect(!store.isImported(sourceKey: successLegacy, variant: .renderedImage), "the migrated row must no longer be readable by its legacy source identity")
+        #expect(store.isImported(sourceKey: conflictLegacy, variant: .renderedImage), "a conflicting legacy row must remain unchanged")
+        #expect(store.isImported(sourceKey: otherCardLegacy, variant: .renderedImage), "a legacy row absent from the current scan must remain unchanged")
+        #expect(!store.isImported(sourceKey: SourceIdentity.key(url: otherCardSource, variant: .renderedImage, sourceRoot: sourceRoot, volumeUUID: volumeUUID), variant: .renderedImage), "migration must not guess another card's row from its filename")
 
         // Open the returned backup through CatalogStore's public API after
         // copying it into the normal catalog location. It must still contain
@@ -265,9 +265,9 @@ struct CatalogBoundaryTests {
         try FileManager.default.createDirectory(at: backupCatalogDirectory, withIntermediateDirectories: true)
         let backupCatalog = backupCatalogDirectory.appendingPathComponent("catalog.sqlite")
         try FileManager.default.copyItem(at: backupURL, to: backupCatalog)
-        let backupStore = try CatalogStore(libraryRoot: backupRoot)
-        #expect(backupStore.isImported(sourceKey: successLegacy, variant: .jpeg), "the pre-migration backup must contain the legacy row")
-        #expect(!backupStore.isImported(sourceKey: successNew, variant: .jpeg), "the pre-migration backup must not contain the new source identity")
+        let backupStore = try InfrastructureTestSupport.catalogStore(libraryRoot: backupRoot)
+        #expect(backupStore.isImported(sourceKey: successLegacy, variant: .renderedImage), "the pre-migration backup must contain the legacy row")
+        #expect(!backupStore.isImported(sourceKey: successNew, variant: .renderedImage), "the pre-migration backup must not contain the new source identity")
     }
 
     @Test("Backup failures preserve the source catalog")
@@ -275,7 +275,7 @@ struct CatalogBoundaryTests {
         let root = temporaryRoot(named: "catalog-backup-failure-boundaries")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let store = try CatalogStore(libraryRoot: root)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
         let missingParent = root.appendingPathComponent("does-not-exist/subdirectory/catalog.sqlite")
         do {
             try store.backup(to: missingParent)
@@ -299,18 +299,18 @@ struct CatalogBoundaryTests {
         try write(contents, to: imported)
         try write(contents, to: library)
 
-        let store = try CatalogStore(libraryRoot: root)
+        let store = try InfrastructureTestSupport.catalogStore(libraryRoot: root)
         let digest = try boundaryHash(imported)
         try store.recordImport(
             sourceKey: "camera:test:IMG_0001:JPG",
-            variant: .jpeg,
+            variant: .renderedImage,
             destinationURL: imported,
             sha256: digest,
             sourceFilename: "IMG_0001.JPG"
         )
         try store.recordLibraryAsset(
             url: library,
-            variant: .jpeg,
+            variant: .renderedImage,
             sha256: digest,
             fileSize: Int64(contents.count)
         )
@@ -318,16 +318,16 @@ struct CatalogBoundaryTests {
         let candidates = store.matchCandidates(
             sourceFilenameKey: "img_0001.jpg",
             fileSize: Int64(contents.count),
-            variant: .jpeg
+            variant: .renderedImage
         )
         #expect(candidates.count == 2, "metadata-only candidate lookup must include imported and library records")
         #expect(candidates.allSatisfy { $0.filenameKey == "img_0001.jpg" }, "candidate lookup must retain normalized filename keys")
         #expect(
-            store.matchCandidates(sourceFilenameKey: "other.jpg", fileSize: Int64(contents.count), variant: .jpeg).isEmpty,
+            store.matchCandidates(sourceFilenameKey: "other.jpg", fileSize: Int64(contents.count), variant: .renderedImage).isEmpty,
             "candidate lookup must use the normalized filename key as well as size and variant"
         )
         #expect(
-            store.existingContentDestination(sha256: digest, variant: .jpeg, fileSize: Int64(contents.count)) != nil,
+            store.existingContentDestination(sha256: digest, variant: .renderedImage, fileSize: Int64(contents.count)) != nil,
             "a verified camera hash must find an existing library destination"
         )
         #expect(
@@ -342,7 +342,7 @@ struct CatalogBoundaryTests {
         let installed = try FileTransferService().installCameraDownloadedFile(
             partialURL: partial,
             destinationURL: cameraDestination,
-            variant: .jpeg,
+            variant: .renderedImage,
             sourceKey: "camera:test:IMG_0001:JPG",
             sourceFilename: "IMG_0001.JPG",
             catalog: store,
@@ -357,7 +357,7 @@ struct CatalogBoundaryTests {
         try write(data, to: destination)
         try store.recordImport(
             sourceKey: sourceKey,
-            variant: .jpeg,
+            variant: .renderedImage,
             destinationURL: destination,
             sha256: boundaryHash(destination),
             sourceFilename: destination.lastPathComponent
@@ -369,12 +369,12 @@ struct CatalogBoundaryTests {
             id: url.deletingPathExtension().path,
             basename: url.deletingPathExtension().lastPathComponent,
             directory: url.deletingLastPathComponent(),
-            jpegURL: url,
+            renderedImageURL: url,
             rawURL: nil,
             movieURL: nil,
             captureDate: nil,
             metadata: .empty,
-            importedJPEG: false,
+            importedRenderedImage: false,
             importedRAW: false,
             isMetadataLoaded: false
         )

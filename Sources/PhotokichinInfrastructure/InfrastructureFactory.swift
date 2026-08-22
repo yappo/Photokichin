@@ -2,20 +2,30 @@ import Foundation
 import PhotokichinApplication
 
 private struct LiveCatalogRepositoryFactory: CatalogRepositoryFactory {
+    let classifier: any MediaFormatClassifying
+
     func open(libraryRoot: URL) throws -> any CatalogRepository {
-        try CatalogStore(libraryRoot: libraryRoot)
+        try CatalogStore(libraryRoot: libraryRoot, classifier: classifier)
     }
 }
 
 @MainActor
 package enum InfrastructureFactory {
     package static func makeAppDependencies() -> AppDependencies {
-        let catalogFactory = LiveCatalogRepositoryFactory()
-        let scanner = PhotoScanner()
+        let composition = InfrastructureComposition.production()
+        let catalogFactory = LiveCatalogRepositoryFactory(classifier: composition.mediaClassifier)
+        let scanner = PhotoScanner(
+            classifier: composition.mediaClassifier,
+            traversalPolicy: composition.traversalPolicy
+        )
         let transfer = FileTransferService()
-        let mediaReader = ImageIOMediaReader()
+        let mediaReader = ImageIOMediaReader(pipeline: composition.metadataPipeline)
         let volumeMonitor = VolumeMonitor()
-        let cameraMonitor = CameraMonitor()
+        let cameraMonitor = CameraMonitor(
+            classifier: composition.mediaClassifier,
+            cameraSupportResolver: composition.cameraSupportResolver,
+            metadataReader: mediaReader
+        )
         let useCases = AppUseCases(
             browsePhotos: BrowsePhotosUseCase(scanner: scanner),
             openCatalog: OpenCatalogUseCase(factory: catalogFactory),

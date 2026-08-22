@@ -27,11 +27,16 @@ final class CatalogStore: @unchecked Sendable, CatalogRepository {
     let catalogURL: URL
     let catalogDirectoryURL: URL
     private let libraryRoot: URL
+    private let classifier: any MediaFormatClassifying
     private var database: OpaquePointer?
     private let lock = NSLock()
 
-    init(libraryRoot: URL) throws {
+    init(
+        libraryRoot: URL,
+        classifier: any MediaFormatClassifying
+    ) throws {
         self.libraryRoot = libraryRoot.standardizedFileURL
+        self.classifier = classifier
         let directory = self.libraryRoot.appendingPathComponent(".photokichin", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         catalogDirectoryURL = directory
@@ -310,7 +315,7 @@ final class CatalogStore: @unchecked Sendable, CatalogRepository {
 
     func registerLibraryAssets(_ groups: [PhotoGroup]) throws {
         let files = groups.flatMap { group in
-            [(AssetVariant.jpeg, group.jpegURL), (AssetVariant.raw, group.rawURL)].compactMap { variant, url in url.map { (variant, $0, group.photoID) } }
+            [(AssetVariant.renderedImage, group.renderedImageURL), (AssetVariant.raw, group.rawURL)].compactMap { variant, url in url.map { (variant, $0, group.photoID) } }
         }
         guard !files.isEmpty else { return }
         lock.lock(); defer { lock.unlock() }
@@ -518,7 +523,7 @@ final class CatalogStore: @unchecked Sendable, CatalogRepository {
     ) throws -> SourceIdentityMigrationResult {
         var mappings: [String: (newKey: String, components: SourceIdentity.Components, variant: AssetVariant)] = [:]
         for group in groups {
-            for (variant, url) in [(AssetVariant.jpeg, group.jpegURL), (AssetVariant.raw, group.rawURL), (AssetVariant.movie, group.movieURL)].compactMap({ variant, url in url.map { (variant, $0) } }) {
+            for (variant, url) in [(AssetVariant.renderedImage, group.renderedImageURL), (AssetVariant.raw, group.rawURL), (AssetVariant.movie, group.movieURL)].compactMap({ variant, url in url.map { (variant, $0) } }) {
                 let legacy = SourceIdentity.legacyKey(url: url, variant: variant)
                 guard let components = SourceIdentity.components(url: url, sourceRoot: sourceRoot, volumeUUID: volumeUUID) else { continue }
                 let newKey = SourceIdentity.key(url: url, variant: variant, sourceRoot: sourceRoot, volumeUUID: volumeUUID)
@@ -986,7 +991,12 @@ final class CatalogStore: @unchecked Sendable, CatalogRepository {
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isHiddenKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
         return enumerator.compactMap { item in
             guard !Task.isCancelled else { return nil }
-            guard let url = item as? URL, ["jpg", "jpeg", "cr3"].contains(url.pathExtension.lowercased()), let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isHiddenKey]), values.isRegularFile == true, values.isHidden != true else { return nil }
+            guard let url = item as? URL,
+                  let variant = classifier.variant(forFilename: url.lastPathComponent),
+                  (variant == .renderedImage || variant == .raw),
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isHiddenKey]),
+                  values.isRegularFile == true,
+                  values.isHidden != true else { return nil }
             return url.standardizedFileURL
         }
     }

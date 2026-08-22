@@ -27,9 +27,29 @@ package enum PhotoGridNavigation {
 }
 
 package enum AssetVariant: String, CaseIterable, Codable, Sendable {
-    case jpeg = "JPG"
+    case renderedImage = "JPG"
     case raw = "CR3"
     case movie = "動画"
+
+    /// A stable semantic role name for user-facing text. The raw value is
+    /// intentionally kept as the legacy persistence and identity contract.
+    package var roleDisplayName: String {
+        switch self {
+        case .renderedImage: return "画像"
+        case .raw: return "RAW"
+        case .movie: return "動画"
+        }
+    }
+
+    /// Uses the concrete filename extension when one is available, while
+    /// keeping role terminology for assets that do not expose a filename.
+    package func displayName(filename: String? = nil) -> String {
+        if let filename {
+            let extensionName = URL(fileURLWithPath: filename).pathExtension
+            if !extensionName.isEmpty { return extensionName.uppercased() }
+        }
+        return roleDisplayName
+    }
 }
 
 /// A reference to a file exposed by ImageCaptureCore. The framework objects
@@ -183,24 +203,24 @@ package enum LibraryAssetStatus: String, Codable, Sendable {
 }
 
 package enum AirDropMode: String, CaseIterable, Identifiable {
-    case jpegAndRaw
-    case jpegOnly
+    case renderedAndRaw
+    case renderedOnly
     case rawOnly
 
     package var id: String { rawValue }
 
     package var title: String {
         switch self {
-        case .jpegAndRaw: return "JPG＋CR3"
-        case .jpegOnly: return "JPGのみ"
-        case .rawOnly: return "CR3のみ"
+        case .renderedAndRaw: return "画像＋RAW"
+        case .renderedOnly: return "画像のみ"
+        case .rawOnly: return "RAWのみ"
         }
     }
 
     package var systemImage: String {
         switch self {
-        case .jpegAndRaw: return "photo.on.rectangle.angled"
-        case .jpegOnly: return "photo"
+        case .renderedAndRaw: return "photo.on.rectangle.angled"
+        case .renderedOnly: return "photo"
         case .rawOnly: return "camera.aperture"
         }
     }
@@ -284,17 +304,17 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
     package let id: String
     package let basename: String
     package let directory: URL
-    package var jpegURL: URL?
+    package var renderedImageURL: URL?
     package var rawURL: URL?
     package var movieURL: URL?
     package var captureDate: Date?
     package var metadata: PhotoMetadata
-    package var importedJPEG: Bool
+    package var importedRenderedImage: Bool
     package var importedRAW: Bool
     /// A metadata-only catalog match. This is deliberately separate from
-    /// importedJPEG/importedRAW because filename, size, and variant do not
+    /// importedRenderedImage/importedRAW because filename, size, and variant do not
     /// prove that two files have identical bytes.
-    package var possibleImportedJPEG: Bool
+    package var possibleImportedRenderedImage: Bool
     package var possibleImportedRAW: Bool
     package var isMetadataLoaded: Bool
     package var libraryAssetStatus: LibraryAssetStatus = .notApplicable
@@ -315,15 +335,15 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
         id: String,
         basename: String,
         directory: URL,
-        jpegURL: URL?,
+        renderedImageURL: URL?,
         rawURL: URL?,
         movieURL: URL?,
         captureDate: Date?,
         metadata: PhotoMetadata,
-        importedJPEG: Bool,
+        importedRenderedImage: Bool,
         importedRAW: Bool,
         isMetadataLoaded: Bool,
-        possibleImportedJPEG: Bool = false,
+        possibleImportedRenderedImage: Bool = false,
         possibleImportedRAW: Bool = false,
         libraryAssetStatus: LibraryAssetStatus = .notApplicable,
         photoID: String? = nil,
@@ -334,14 +354,14 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
         self.id = id
         self.basename = basename
         self.directory = directory
-        self.jpegURL = jpegURL
+        self.renderedImageURL = renderedImageURL
         self.rawURL = rawURL
         self.movieURL = movieURL
         self.captureDate = captureDate
         self.metadata = metadata
-        self.importedJPEG = importedJPEG
+        self.importedRenderedImage = importedRenderedImage
         self.importedRAW = importedRAW
-        self.possibleImportedJPEG = possibleImportedJPEG
+        self.possibleImportedRenderedImage = possibleImportedRenderedImage
         self.possibleImportedRAW = possibleImportedRAW
         self.isMetadataLoaded = isMetadataLoaded
         self.libraryAssetStatus = libraryAssetStatus
@@ -363,13 +383,13 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
         return lhs.id < rhs.id
     }
 
-    package var primaryURL: URL? { jpegURL ?? rawURL ?? movieURL }
+    package var primaryURL: URL? { renderedImageURL ?? rawURL ?? movieURL }
 
     package var isCameraBacked: Bool { cameraReference != nil }
 
     package func url(for variant: AssetVariant) -> URL? {
         switch variant {
-        case .jpeg: return jpegURL
+        case .renderedImage: return renderedImageURL
         case .raw: return rawURL
         case .movie: return movieURL
         }
@@ -377,7 +397,7 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
 
     package var variants: [AssetVariant] {
         var result: [AssetVariant] = []
-        if jpegURL != nil { result.append(.jpeg) }
+        if renderedImageURL != nil { result.append(.renderedImage) }
         if rawURL != nil { result.append(.raw) }
         if movieURL != nil { result.append(.movie) }
         if let cameraReference {
@@ -389,7 +409,7 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
     }
 
     package var importableVariants: [AssetVariant] {
-        variants.filter { $0 == .jpeg || $0 == .raw }
+        variants.filter { $0 == .renderedImage || $0 == .raw }
     }
 
     package var dateKey: String {
@@ -403,7 +423,7 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
 
         let imported = importableVariants.filter { variant in
             switch variant {
-            case .jpeg: return importedJPEG
+            case .renderedImage: return importedRenderedImage
             case .raw: return importedRAW
             case .movie: return false
             }
@@ -416,7 +436,7 @@ package struct PhotoGroup: Identifiable, Hashable, Sendable {
     package var hasPossibleImport: Bool {
         importableVariants.contains { variant in
             switch variant {
-            case .jpeg: return !importedJPEG && possibleImportedJPEG
+            case .renderedImage: return !importedRenderedImage && possibleImportedRenderedImage
             case .raw: return !importedRAW && possibleImportedRAW
             case .movie: return false
             }
@@ -559,7 +579,7 @@ package enum AppError: LocalizedError {
 
     package var errorDescription: String? {
         switch self {
-        case .noSource: return "読み込むSDカードまたはフォルダが選択されていません。"
+        case .noSource: return "読み込むSDカード、USBカメラ、または写真の入ったフォルダが選択されていません。"
         case .noSelectedPhotos: return "写真が選択されていません。"
         case .noDeleteCandidates: return "削除候補が選択されていません。"
         case .noLibrary: return "取り込み先が設定されていません。"

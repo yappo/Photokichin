@@ -10,17 +10,22 @@ import PhotokichinDomain
 /// A point-in-time summary of the files that ImageCaptureCore has exposed.
 /// File sizes are catalog metadata; no photo bytes are read here.
 private struct CameraCatalogSummary: Sendable {
+    private let classifier: any MediaFormatClassifying
     var fileCount = 0
     var totalBytes: Int64 = 0
     var minimumBytes: Int64?
     var maximumBytes: Int64 = 0
-    var jpegCount = 0
+    var renderedImageCount = 0
     var rawCount = 0
     var movieCount = 0
     var otherCount = 0
-    var jpegBytes: Int64 = 0
+    var renderedImageBytes: Int64 = 0
     var rawBytes: Int64 = 0
     var movieBytes: Int64 = 0
+
+    init(classifier: any MediaFormatClassifying) {
+        self.classifier = classifier
+    }
 
     mutating func add(_ file: ICCameraFile) {
         let size = Int64(file.fileSize)
@@ -29,18 +34,17 @@ private struct CameraCatalogSummary: Sendable {
         minimumBytes = minimumBytes.map { min($0, size) } ?? size
         maximumBytes = max(maximumBytes, size)
 
-        switch URL(fileURLWithPath: file.originalFilename ?? file.name ?? "")
-            .pathExtension.lowercased() {
-        case "jpg", "jpeg":
-            jpegCount += 1
-            jpegBytes += size
-        case "cr3":
+        switch classifier.variant(forFilename: file.originalFilename ?? file.name ?? "") {
+        case .renderedImage:
+            renderedImageCount += 1
+            renderedImageBytes += size
+        case .raw:
             rawCount += 1
             rawBytes += size
-        case "mov", "mp4":
+        case .movie:
             movieCount += 1
             movieBytes += size
-        default: otherCount += 1
+        case nil: otherCount += 1
         }
     }
 
@@ -228,7 +232,7 @@ private final class CameraRequestGate: @unchecked Sendable {
         summaryScanElapsed: TimeInterval
     ) {
         logger.notice(
-            "camera_io session_ready elapsed_seconds=\(elapsed, privacy: .public) files_per_second=\(elapsed > 0 ? Double(mediaFileCount) / elapsed : 0, privacy: .public) total_file_bytes=\(summary.totalBytes, privacy: .public) bytes_per_second=\(elapsed > 0 ? Double(summary.totalBytes) / elapsed : 0, privacy: .public) media_files=\(mediaFileCount, privacy: .public) catalog_percent=\(catalogPercent, privacy: .public) average_file_bytes=\(summary.averageBytes, privacy: .public) minimum_file_bytes=\(summary.minimumBytesForLog, privacy: .public) maximum_file_bytes=\(summary.maximumBytes, privacy: .public) jpeg_files=\(summary.jpegCount, privacy: .public) jpeg_bytes=\(summary.jpegBytes, privacy: .public) raw_files=\(summary.rawCount, privacy: .public) raw_bytes=\(summary.rawBytes, privacy: .public) movie_files=\(summary.movieCount, privacy: .public) movie_bytes=\(summary.movieBytes, privacy: .public) other_files=\(summary.otherCount, privacy: .public) summary_scan_elapsed_ms=\(summaryScanElapsed * 1000, privacy: .public) usb_speed=\(usb.speed, privacy: .public) usb_probe_elapsed_ms=\(usb.probeElapsed * 1000, privacy: .public)"
+            "camera_io session_ready elapsed_seconds=\(elapsed, privacy: .public) files_per_second=\(elapsed > 0 ? Double(mediaFileCount) / elapsed : 0, privacy: .public) total_file_bytes=\(summary.totalBytes, privacy: .public) bytes_per_second=\(elapsed > 0 ? Double(summary.totalBytes) / elapsed : 0, privacy: .public) media_files=\(mediaFileCount, privacy: .public) catalog_percent=\(catalogPercent, privacy: .public) average_file_bytes=\(summary.averageBytes, privacy: .public) minimum_file_bytes=\(summary.minimumBytesForLog, privacy: .public) maximum_file_bytes=\(summary.maximumBytes, privacy: .public) rendered_image_files=\(summary.renderedImageCount, privacy: .public) rendered_image_bytes=\(summary.renderedImageBytes, privacy: .public) raw_files=\(summary.rawCount, privacy: .public) raw_bytes=\(summary.rawBytes, privacy: .public) movie_files=\(summary.movieCount, privacy: .public) movie_bytes=\(summary.movieBytes, privacy: .public) other_files=\(summary.otherCount, privacy: .public) summary_scan_elapsed_ms=\(summaryScanElapsed * 1000, privacy: .public) usb_speed=\(usb.speed, privacy: .public) usb_probe_elapsed_ms=\(usb.probeElapsed * 1000, privacy: .public)"
         )
     }
 
@@ -333,24 +337,50 @@ struct CameraCatalogRefreshGate {
 /// ImageCaptureCore.  It deliberately replaces the previous snapshot: a
 /// group absent from the current camera input is not carried forward.
 enum CameraCatalogBuilder {
-    static func variant(for filename: String) -> AssetVariant? {
-        switch URL(fileURLWithPath: filename).pathExtension.lowercased() {
-        case "jpg", "jpeg": return .jpeg
-        case "cr3": return .raw
-        case "mov", "mp4": return .movie
-        default: return nil
-        }
+    static func variant(
+        for filename: String,
+        classifier: any MediaFormatClassifying
+    ) -> AssetVariant? {
+        classifier.variant(forFilename: filename)
     }
 
     static func groups(
         cameraID: String,
         cameraName: String?,
         entries: [CameraCatalogEntry],
-        previousGroups: [PhotoGroup]
+        previousGroups: [PhotoGroup],
+        classifier: any MediaFormatClassifying
     ) -> [PhotoGroup] {
+        let classifiedEntries = entries.compactMap { entry -> CameraCatalogEntry? in
+            guard let assetVariant = classifier.variant(forFilename: entry.asset.filename) else { return nil }
+            let asset = CameraCatalogAsset(
+                identifier: entry.asset.identifier,
+                filename: entry.asset.filename,
+                remotePath: entry.asset.remotePath,
+                variant: assetVariant,
+                fileSize: entry.asset.fileSize,
+                captureDate: entry.asset.captureDate,
+                width: entry.asset.width,
+                height: entry.asset.height
+            )
+            let pairedRaw = entry.pairedRaw.flatMap { raw -> CameraCatalogAsset? in
+                guard let rawVariant = classifier.variant(forFilename: raw.filename) else { return nil }
+                return CameraCatalogAsset(
+                    identifier: raw.identifier,
+                    filename: raw.filename,
+                    remotePath: raw.remotePath,
+                    variant: rawVariant,
+                    fileSize: raw.fileSize,
+                    captureDate: raw.captureDate,
+                    width: raw.width,
+                    height: raw.height
+                )
+            }
+            return CameraCatalogEntry(asset: asset, pairedRaw: pairedRaw)
+        }
         var uniqueEntries: [CameraCatalogEntry] = []
         var indexByIdentifier: [String: Int] = [:]
-        for entry in entries {
+        for entry in classifiedEntries {
             if let index = indexByIdentifier[entry.asset.identifier] {
                 // Duplicate notifications for one asset must not create a
                 // second asset, but a later notification may carry the
@@ -378,7 +408,7 @@ enum CameraCatalogBuilder {
 
         var pairedGroupKeys: [String: String] = [:]
         for entry in uniqueEntries {
-            guard entry.asset.variant == .jpeg, let raw = entry.pairedRaw else { continue }
+            guard entry.asset.variant == .renderedImage, let raw = entry.pairedRaw else { continue }
             let groupKey = remotePathWithoutExtension(entry.asset.remotePath)
             pairedGroupKeys[entry.asset.identifier] = groupKey
             pairedGroupKeys[raw.identifier] = groupKey
@@ -393,7 +423,7 @@ enum CameraCatalogBuilder {
                 id: groupID,
                 basename: URL(fileURLWithPath: groupKey).lastPathComponent,
                 directory: cameraDirectoryURL(cameraID: cameraID, remotePath: asset.remotePath),
-                jpegURL: nil,
+                renderedImageURL: nil,
                 rawURL: nil,
                 movieURL: nil,
                 captureDate: asset.captureDate,
@@ -413,7 +443,7 @@ enum CameraCatalogBuilder {
                     pixelWidth: asset.width > 0 ? asset.width : nil,
                     pixelHeight: asset.height > 0 ? asset.height : nil
                 ),
-                importedJPEG: false,
+                importedRenderedImage: false,
                 importedRAW: false,
                 isMetadataLoaded: false,
                 cameraReference: CameraPhotoReference(cameraID: cameraID, groupKey: groupKey, assets: [])
@@ -470,6 +500,114 @@ enum CameraCatalogBuilder {
     }
 }
 
+/// ImageCaptureCore documents these completions as arbitrary-queue callbacks.
+/// Keep their entry points outside CameraMonitor's MainActor context; only
+/// state publication is explicitly scheduled back to MainActor.
+enum CameraCompletionAdapter {
+    static var ignoreDeleteFailures: @Sendable ([ICDeleteError: ICCameraItem]) -> Void {
+        { _ in }
+    }
+
+    static func download(
+        directory: URL,
+        filename: String,
+        expectedURL: URL,
+        continuation: CheckedContinuation<URL, Error>
+    ) -> @Sendable (String?, Error?) -> Void {
+        { returnedFilename, error in
+            if let error {
+                continuation.resume(throwing: error)
+                return
+            }
+
+            let returnedName = returnedFilename.map { URL(fileURLWithPath: $0).lastPathComponent }
+            let returnedURL = returnedName.map { directory.appendingPathComponent($0) }
+            if let returnedURL, FileManager.default.fileExists(atPath: returnedURL.path) {
+                continuation.resume(returning: returnedURL)
+            } else if FileManager.default.fileExists(atPath: expectedURL.path) {
+                continuation.resume(returning: expectedURL)
+            } else {
+                continuation.resume(throwing: NSError(
+                    domain: "Photokichin.Camera",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "カメラからのダウンロード後にファイルが見つかりません: \(filename)"]
+                ))
+            }
+        }
+    }
+
+    static func eject(
+        handler: @escaping @MainActor @Sendable (Error?) -> Void
+    ) -> @Sendable (Error?) -> Void {
+        let state = OSAllocatedUnfairLock<(completed: Bool, error: (any Error)?)>(
+            initialState: (completed: false, error: nil)
+        )
+        return { error in
+            let accepted = state.withLock { state -> Bool in
+                guard !state.completed else { return false }
+                state.completed = true
+                state.error = error
+                return true
+            }
+            guard accepted else { return }
+            Task { @MainActor in
+                let error = state.withLock { state -> (any Error)? in
+                    let error = state.error
+                    state.error = nil
+                    return error
+                }
+                handler(error)
+            }
+        }
+    }
+
+    static func delete(
+        variant: AssetVariant,
+        filename: String?,
+        continuation: CheckedContinuation<Void, Error>
+    ) -> @Sendable ([ICDeleteResult: [ICCameraItem]], Error?) -> Void {
+        { result, error in
+            if let error {
+                continuation.resume(throwing: error)
+            } else if let failedItems = result[.failed], !failedItems.isEmpty {
+                continuation.resume(throwing: NSError(
+                    domain: "Photokichin.Camera",
+                    code: 6,
+                    userInfo: [NSLocalizedDescriptionKey: "カメラ上の\(variant.displayName(filename: filename))を削除できませんでした"]
+                ))
+            } else {
+                continuation.resume(returning: ())
+            }
+        }
+    }
+
+    fileprivate static func metadata(
+        gate: CameraRequestGate,
+        file: ICCameraFile,
+        reader: any MetadataDictionaryReading,
+        filename: String?,
+        continuation: CheckedContinuation<PhotoMetadata?, Never>
+    ) -> @Sendable ([AnyHashable: Any]?, Error?) -> Void {
+        { dictionary, _ in
+            gate.endMetadata(file)
+            continuation.resume(returning: dictionary.flatMap {
+                reader.readMetadata(properties: $0, filename: filename)
+            })
+        }
+    }
+
+    fileprivate static func thumbnail(
+        gate: CameraRequestGate,
+        file: ICCameraFile,
+        continuation: CheckedContinuation<Data?, Never>
+    ) -> @Sendable (Data?, Error?) -> Void {
+        { data, _ in
+            gate.endThumbnail(file)
+            continuation.resume(returning: data)
+        }
+    }
+}
+
 /// Owns the ImageCaptureCore browser and the live ICCameraFile objects. A
 /// camera is a PTP device, not a filesystem volume, so this is intentionally
 /// separate from VolumeMonitor and PhotoScanner.
@@ -479,6 +617,9 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
 
     private(set) var cameras: [CameraDescriptor] = []
     private let browser = ICDeviceBrowser()
+    private let classifier: any MediaFormatClassifying
+    private let cameraSupportResolver: CameraSupportResolver
+    private let metadataReader: any MetadataDictionaryReading
     nonisolated private let requestGate = CameraRequestGate()
     private let logger = Logger(subsystem: "jp.yappo.Photokichin", category: "camera-io")
     private var records: [String: CameraRecord] = [:]
@@ -493,6 +634,7 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
         var filesByIdentifier: [String: ICCameraFile] = [:]
         var groups: [PhotoGroup] = []
         var usbInfo: CameraUSBInfo
+        var supportIdentifier: String?
         var catalogProgressTask: Task<Void, Never>?
         var catalogRefreshNextAllowedAt: Date?
         var catalogRefreshInFlight = false
@@ -502,11 +644,12 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
         var catalogRefreshAcceptedCount = 0
         var catalogRefreshIgnoredCount = 0
 
-        init(device: ICCameraDevice, descriptor: CameraDescriptor) {
+        init(device: ICCameraDevice, descriptor: CameraDescriptor, supportIdentifier: String?) {
             self.device = device
             self.sessionRequestedAt = Date()
             self.descriptor = descriptor
             self.usbInfo = CameraUSBInfo.read(for: device)
+            self.supportIdentifier = supportIdentifier
         }
     }
 
@@ -523,7 +666,14 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
         var lastInputAt: Date?
     }
 
-    override init() {
+    init(
+        classifier: any MediaFormatClassifying,
+        cameraSupportResolver: CameraSupportResolver,
+        metadataReader: any MetadataDictionaryReading
+    ) {
+        self.classifier = classifier
+        self.cameraSupportResolver = cameraSupportResolver
+        self.metadataReader = metadataReader
         super.init()
         browser.delegate = self
         browser.browsedDeviceTypeMask = ICDeviceTypeMask(
@@ -629,9 +779,12 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
         let cameraID = cameraIdentifier(record.device)
         updateState(for: record, state: .ejecting)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            record.device.requestEject { [weak self] error in
-                Task { @MainActor in
-                    guard let self else { return }
+            let completion = CameraCompletionAdapter.eject(
+                handler: { [weak self] error in
+                    guard let self else {
+                        continuation.resume(throwing: AppError.ejectFailed("カメラが切断されました"))
+                        return
+                    }
                     guard let record = self.records[cameraID] else {
                         continuation.resume(throwing: AppError.ejectFailed("カメラが切断されました"))
                         return
@@ -644,7 +797,8 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
                         continuation.resume(returning: ())
                     }
                 }
-            }
+            )
+            record.device.requestEject(completion: completion)
         }
     }
 
@@ -677,31 +831,18 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
                 .saveAsFilename: filename,
                 .overwrite: true
             ]
-            file.requestDownload(options: options) { returnedFilename, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                let returnedName = returnedFilename.map { URL(fileURLWithPath: $0).lastPathComponent }
-                let returnedURL = returnedName.map { directory.appendingPathComponent($0) }
-                if let returnedURL, FileManager.default.fileExists(atPath: returnedURL.path) {
-                    continuation.resume(returning: returnedURL)
-                } else if FileManager.default.fileExists(atPath: expectedURL.path) {
-                    continuation.resume(returning: expectedURL)
-                } else {
-                    continuation.resume(throwing: NSError(
-                        domain: "Photokichin.Camera",
-                        code: 2,
-                        userInfo: [NSLocalizedDescriptionKey: "カメラからのダウンロード後にファイルが見つかりません: \(filename)"]
-                    ))
-                }
-            }
+            let completion = CameraCompletionAdapter.download(
+                directory: directory,
+                filename: filename,
+                expectedURL: expectedURL,
+                continuation: continuation
+            )
+            file.requestDownload(options: options, completion: completion)
         }
     }
 
     /// Deletes one camera file. Callers use this operation for every selected
-    /// JPG/CR3 asset after one explicit group-level confirmation.
+    /// rendered-image/RAW asset after one explicit group-level confirmation.
     func delete(group: PhotoGroup, variant: AssetVariant) async throws {
         guard let reference = group.cameraReference,
               let file = file(for: reference, variant: variant),
@@ -732,20 +873,12 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 let progress = device.requestDeleteFiles(
                     [file],
-                    deleteFailed: { _ in },
-                    completion: { result, error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else if let failedItems = result[.failed], !failedItems.isEmpty {
-                            continuation.resume(throwing: NSError(
-                                domain: "Photokichin.Camera",
-                                code: 6,
-                                userInfo: [NSLocalizedDescriptionKey: "カメラ上の\(variant.rawValue)を削除できませんでした"]
-                            ))
-                        } else {
-                            continuation.resume(returning: ())
-                        }
-                    }
+                    deleteFailed: CameraCompletionAdapter.ignoreDeleteFailures,
+                    completion: CameraCompletionAdapter.delete(
+                        variant: variant,
+                        filename: reference.asset(for: variant)?.filename,
+                        continuation: continuation
+                    )
                 )
                 if progress == nil {
                     continuation.resume(throwing: NSError(
@@ -830,7 +963,7 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
             guard let self, let record = self.record(for: device) else { return }
             self.flushCatalogInput(for: device)
             let summaryStartedAt = Date()
-            var summary = CameraCatalogSummary()
+            var summary = CameraCatalogSummary(classifier: self.classifier)
             for file in (device.mediaFiles ?? []).compactMap({ $0 as? ICCameraFile }) {
                 summary.add(file)
             }
@@ -933,11 +1066,22 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
             canEject: canEject(camera),
             connectionState: .openingSession
         )
-        let record = CameraRecord(device: camera, descriptor: descriptor)
+        let identity = CameraIdentity(
+            reportedName: camera.name,
+            productKind: camera.productKind,
+            usbVendorID: Int(camera.usbVendorID),
+            usbProductID: Int(camera.usbProductID)
+        )
+        let supportIdentifier = cameraSupportResolver.supportIdentifier(for: identity)
+        let record = CameraRecord(
+            device: camera,
+            descriptor: descriptor,
+            supportIdentifier: supportIdentifier
+        )
         records[id] = record
         catalogTraces[id] = CatalogTrace()
         logger.notice(
-            "camera_io session_requested camera_id=\(id, privacy: .public) usb_vendor_id=\(camera.usbVendorID, privacy: .public) usb_product_id=\(camera.usbProductID, privacy: .public) usb_location_id=\(camera.usbLocationID, privacy: .public) usb_speed=\(record.usbInfo.speed, privacy: .public) usb_probe_elapsed_ms=\(record.usbInfo.probeElapsed * 1000, privacy: .public)"
+            "camera_io session_requested camera_id=\(id, privacy: .public) support_identifier=\(supportIdentifier ?? "none", privacy: .public) usb_vendor_id=\(camera.usbVendorID, privacy: .public) usb_product_id=\(camera.usbProductID, privacy: .public) usb_location_id=\(camera.usbLocationID, privacy: .public) usb_speed=\(record.usbInfo.speed, privacy: .public) usb_probe_elapsed_ms=\(record.usbInfo.probeElapsed * 1000, privacy: .public)"
         )
         camera.delegate = self
         publishDescriptors()
@@ -1065,7 +1209,7 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
         )
 
         var files = (camera.mediaFiles ?? []).compactMap { $0 as? ICCameraFile }
-        // ImageCaptureCore exposes the JPG/CR3 relationship through
+        // ImageCaptureCore exposes the rendered-image/RAW relationship through
         // pairedRawImage. Keep a paired RAW in the catalog even if a camera
         // driver omitted it from the flat mediaFiles array.
         var knownIdentifiers = Set<String>()
@@ -1137,7 +1281,8 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
             cameraID: id,
             cameraName: camera.name,
             entries: entries,
-            previousGroups: record.groups
+            previousGroups: record.groups,
+            classifier: classifier
         )
         if isComplete {
             record.catalogProgressTask?.cancel()
@@ -1236,31 +1381,38 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
     func requestMetadata(for group: PhotoGroup) async -> PhotoMetadata? {
         guard let reference = group.cameraReference,
               let record = records[reference.cameraID],
-              let asset = reference.asset(for: .jpeg) ?? reference.assets.first,
+              let asset = reference.asset(for: .renderedImage) ?? reference.assets.first,
               let file = record.filesByIdentifier[asset.identifier] else { return nil }
 
         let gate = requestGate
+        let metadataReader = metadataReader
         gate.beginMetadata(file)
         return await withCheckedContinuation { continuation in
-            file.requestMetadataDictionary(options: nil) { dictionary, _ in
-                gate.endMetadata(file)
-                continuation.resume(returning: dictionary.flatMap { ImageIOReader.readMetadata(properties: $0) })
-            }
+            let completion = CameraCompletionAdapter.metadata(
+                gate: gate,
+                file: file,
+                reader: metadataReader,
+                filename: asset.filename,
+                continuation: continuation
+            )
+            file.requestMetadataDictionary(options: nil, completion: completion)
         }
     }
 
     func requestThumbnailData(for group: PhotoGroup, maxPixel: Int) async -> Data? {
         guard let reference = group.cameraReference,
-              let asset = reference.asset(for: .jpeg) ?? reference.asset(for: .raw),
+              let asset = reference.asset(for: .renderedImage) ?? reference.asset(for: .raw),
               let file = file(for: reference, variant: asset.variant) else { return nil }
 
         let gate = requestGate
         gate.beginThumbnail(file)
         return await withCheckedContinuation { continuation in
-            file.requestThumbnailData(options: [.imageSourceThumbnailMaxPixelSize: maxPixel]) { data, _ in
-                gate.endThumbnail(file)
-                continuation.resume(returning: data)
-            }
+            let completion = CameraCompletionAdapter.thumbnail(
+                gate: gate,
+                file: file,
+                continuation: continuation
+            )
+            file.requestThumbnailData(options: [.imageSourceThumbnailMaxPixelSize: maxPixel], completion: completion)
         }
     }
 
@@ -1320,7 +1472,7 @@ final class CameraMonitor: NSObject, CameraMonitoring, ICDeviceBrowserDelegate, 
     }
 
     private func variant(for filename: String) -> AssetVariant? {
-        CameraCatalogBuilder.variant(for: filename)
+        CameraCatalogBuilder.variant(for: filename, classifier: classifier)
     }
 
     private func remotePath(for file: ICCameraFile, filename: String) -> String {

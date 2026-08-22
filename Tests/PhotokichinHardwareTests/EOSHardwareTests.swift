@@ -13,12 +13,17 @@ struct EOSHardwareTests {
         .enabled(if: hardwareTestsEnabled, "PHOTOKICHIN_RUN_HARDWARE_TESTS=1 のときだけ実行します")
     )
     func mountedCard() throws {
+        let composition = InfrastructureComposition.production()
         let card = URL(fileURLWithPath: "/Volumes/EOS_DIGITAL")
         try #require(
             FileManager.default.fileExists(atPath: card.path),
             "PHOTOKICHIN_RUN_HARDWARE_TESTS=1ですが、/Volumes/EOS_DIGITALがマウントされていません"
         )
-        let groups = PhotoScanner().scan(
+        let scanner = PhotoScanner(
+            classifier: composition.mediaClassifier,
+            traversalPolicy: composition.traversalPolicy
+        )
+        let groups = scanner.scan(
             root: card,
             initialPresentationBatchSize: .max,
             initialPresentationGroupTarget: .max,
@@ -29,27 +34,28 @@ struct EOSHardwareTests {
         } else {
             #expect(!groups.isEmpty)
         }
-        #expect(groups.contains { $0.jpegURL != nil && $0.rawURL != nil })
+        #expect(groups.contains { $0.renderedImageURL != nil && $0.rawURL != nil })
         #expect(groups.allSatisfy { !$0.id.contains("CANONMSC") })
 
-        let first = try #require(groups.first { $0.jpegURL != nil && $0.rawURL != nil })
-        let jpeg = try #require(first.jpegURL)
+        let first = try #require(groups.first { $0.renderedImageURL != nil && $0.rawURL != nil })
+        let jpeg = try #require(first.renderedImageURL)
         let raw = try #require(first.rawURL)
-        let metadata = try #require(ImageIOMediaReader().readMetadata(url: jpeg))
+        let metadataReader = ImageIOMediaReader(pipeline: composition.metadataPipeline)
+        let metadata = try #require(metadataReader.readMetadata(url: jpeg))
         #expect(metadata.cameraModel?.contains("EOS R") == true)
         #expect(metadata.captureDate != nil)
         #expect(metadata.iso != nil)
 
         let transfer = FileTransferService()
-        #expect(transfer.urlsForAirDrop([first], mode: .jpegAndRaw).count == 2)
-        #expect(transfer.urlsForAirDrop([first], mode: .jpegOnly).count == 1)
+        #expect(transfer.urlsForAirDrop([first], mode: .renderedAndRaw).count == 2)
+        #expect(transfer.urlsForAirDrop([first], mode: .renderedOnly).count == 1)
         #expect(transfer.urlsForAirDrop([first], mode: .rawOnly).count == 1)
 
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("Photokichin-hardware-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temporaryRoot) }
         try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
-        let catalog = try CatalogStore(libraryRoot: temporaryRoot)
+        let catalog = try CatalogStore(libraryRoot: temporaryRoot, classifier: composition.mediaClassifier)
         let result = try transfer.importGroup(
             first,
             to: temporaryRoot,

@@ -43,8 +43,8 @@ package struct ContentView: View {
             Button("キャンセル", role: .cancel) {}
         } message: {
             Text(model.sourceCamera == nil
-                ? "削除候補にしたJPGとCR3をmacOSのゴミ箱へ移動します。実行前に確認してください。"
-                : "削除候補にしたカメラ内のJPGとCR3をカメラから削除します。ゴミ箱には入らず、復元できない場合があります。実行前に確認してください。")
+                ? "削除候補にした画像とRAWをmacOSのゴミ箱へ移動します。実行前に確認してください。"
+                : "削除候補にしたカメラ内の画像とRAWをカメラから削除します。ゴミ箱には入らず、復元できない場合があります。実行前に確認してください。")
         }
         .alert("Photokichin", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("閉じる", role: .cancel) { model.errorMessage = nil }
@@ -812,7 +812,7 @@ private struct PhotoListView: View {
                             // source switch cannot reuse another tile state.
                             // Variant paths are also part of the identity:
                             // an incremental card scan can publish a group
-                            // after finding one member of a JPG/CR3 pair, then
+                            // after finding one member of a rendered-image/RAW pair, then
                             // complete that same group in the final snapshot.
                             .id(tileIdentity(for: group))
                         }
@@ -873,7 +873,7 @@ private struct PhotoListView: View {
     private func tileIdentity(for group: PhotoGroup) -> String {
         [
             group.id,
-            group.jpegURL?.path ?? "",
+            group.renderedImageURL?.path ?? "",
             group.rawURL?.path ?? "",
             group.movieURL?.path ?? "",
             group.cameraReference?.cameraID ?? "",
@@ -1616,7 +1616,7 @@ private struct PhotoGroupTile: View {
         .task(id: [
             group.id,
             String(Int(size)),
-            group.jpegURL?.path ?? "",
+            group.renderedImageURL?.path ?? "",
             group.rawURL?.path ?? "",
             group.movieURL?.path ?? "",
             group.cameraReference?.cameraID ?? "",
@@ -1704,13 +1704,21 @@ private struct PhotoVariantBadges: View {
     let group: PhotoGroup
 
     var body: some View {
-        let hasJPEG = group.variants.contains(.jpeg)
+        let hasRenderedImage = group.variants.contains(.renderedImage)
         let hasRAW = group.variants.contains(.raw)
+        let renderedFilename = group.renderedImageURL?.lastPathComponent
+            ?? group.cameraReference?.asset(for: .renderedImage)?.filename
+        let rawFilename = group.rawURL?.lastPathComponent
+            ?? group.cameraReference?.asset(for: .raw)?.filename
         HStack(spacing: 4) {
-            if hasJPEG { Badge(text: "JPG", color: .blue) }
-            if hasRAW { Badge(text: "RAW", color: .orange) }
+            if hasRenderedImage {
+                Badge(text: AssetVariant.renderedImage.displayName(filename: renderedFilename), color: .blue)
+            }
+            if hasRAW {
+                Badge(text: AssetVariant.raw.displayName(filename: rawFilename), color: .orange)
+            }
             if group.libraryAssetStatus == .unregistered || group.libraryAssetStatus == .partial {
-                if hasJPEG || hasRAW {
+                if hasRenderedImage || hasRAW {
                     Divider()
                         .frame(height: 14)
                         .padding(.horizontal, 3)
@@ -1748,7 +1756,7 @@ private struct EmptyStateView: View {
                 .foregroundStyle(.secondary)
             Text("写真を表示する場所を選択してください")
                 .font(.title3.weight(.semibold))
-        Text("EOS RのSDカード、USBカメラ、または写真の入ったフォルダを選択します。")
+            Text("SDカード、USBカメラ、または写真の入ったフォルダを選択します。")
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2258,7 +2266,7 @@ private struct CatalogIssueRow: View {
                 .foregroundStyle(issueColor)
                 .frame(width: 28)
             VStack(alignment: .leading, spacing: 3) {
-                Text("\(issue.lastKnownURL.deletingPathExtension().lastPathComponent)  [\(issue.variant.rawValue)]")
+                Text("\(issue.lastKnownURL.deletingPathExtension().lastPathComponent)  [\(issue.variant.displayName(filename: issue.lastKnownURL.lastPathComponent))]")
                     .font(.callout.weight(.semibold))
                 Text(issueDescription)
                     .font(.caption)
@@ -2338,7 +2346,7 @@ private struct ImportSheet: View {
                 .font(.title2.weight(.semibold))
             Text(isLibraryCopy
                 ? "選択した写真を、コピー元ライブラリの構成を保ったままターゲットライブラリへコピーします。"
-                : "選択した写真はJPGとCR3をセットで安全にコピーします。元のカード上のファイルは変更しません。")
+                : "選択した写真は画像とRAWをセットで安全にコピーします。元のカード上のファイルは変更しません。")
                 .foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Label(sourceName, systemImage: sourceIcon)
@@ -2387,7 +2395,7 @@ private struct ImportSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                Text("JPG・CR3、ファイルのタイムスタンプ、元ライブラリのフォルダ構成を維持します。")
+                Text("画像とRAW、ファイルのタイムスタンプ、元ライブラリのフォルダ構成を維持します。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
