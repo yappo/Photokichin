@@ -10,20 +10,13 @@ macos_dir="$contents_dir/MacOS"
 rm -rf "$build_dir"
 mkdir -p "$macos_dir" "$contents_dir/Resources"
 
-export CLANG_MODULE_CACHE_PATH="$build_dir/ModuleCache"
+swift build \
+  --package-path "$app_dir" \
+  -c release \
+  --product Photokichin
 
-swiftc \
-  -parse-as-library \
-  "$app_dir"/Sources/*.swift \
-  -o "$macos_dir/Photokichin" \
-  -framework SwiftUI \
-  -framework AppKit \
-  -framework ImageIO \
-  -framework ImageCaptureCore \
-  -framework DiskArbitration \
-  -framework UniformTypeIdentifiers \
-  -lsqlite3 \
-  -O
+swiftpm_bin_dir="$(swift build --package-path "$app_dir" -c release --show-bin-path)"
+cp "$swiftpm_bin_dir/Photokichin" "$macos_dir/Photokichin"
 
 cp "$app_dir/Resources/Info.plist" "$contents_dir/Info.plist"
 cp "$app_dir/Resources/Photokichin.icns" "$contents_dir/Resources/Photokichin.icns"
