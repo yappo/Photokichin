@@ -57,6 +57,149 @@ struct InfrastructureBehaviorTests {
         #expect(both.allSatisfy { FileManager.default.isReadableFile(atPath: $0.path) }, "library AirDrop URLs must be readable files")
     }
 
+    @Test("AirDrop URL selection preserves every rendered/RAW pair in all three modes")
+    func airDropFormatMatrix() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Photokichin-airdrop-format-matrix-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let pairs: [(rendered: String, raw: String)] = [
+            ("JPG", "CR3"),
+            ("HIF", "CR3"),
+            ("JPG", "CR2"),
+            ("JPG", "ARW"),
+            ("JPG", "NEF"),
+            ("JPG", "RAF"),
+            ("JPG", "RW2"),
+            ("JPG", "ORF"),
+            ("JPG", "PEF"),
+            ("JPG", "DNG")
+        ]
+        var groups: [PhotoGroup] = []
+        for (index, pair) in pairs.enumerated() {
+            let directory = root.appendingPathComponent("PAIR_\(index)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let rendered = directory.appendingPathComponent("IMG_\(index).\(pair.rendered)")
+            let raw = directory.appendingPathComponent("IMG_\(index).\(pair.raw)")
+            try Data("rendered \(pair.rendered)".utf8).write(to: rendered)
+            try Data("raw \(pair.raw)".utf8).write(to: raw)
+            groups.append(PhotoGroup(
+                id: directory.appendingPathComponent("IMG_\(index)").path,
+                basename: "IMG_\(index)",
+                directory: directory,
+                renderedImageURL: rendered,
+                rawURL: raw,
+                movieURL: nil,
+                captureDate: nil,
+                metadata: .empty,
+                importedRenderedImage: false,
+                importedRAW: false,
+                isMetadataLoaded: true
+            ))
+        }
+
+        let transfer = FileTransferService()
+        let both = transfer.urlsForAirDrop(groups, mode: .renderedAndRaw)
+        let expectedBoth = groups.flatMap { [$0.renderedImageURL!, $0.rawURL!] }
+        #expect(both.map(\.standardizedFileURL.path) == expectedBoth.map(\.standardizedFileURL.path))
+        #expect(
+            transfer.urlsForAirDrop(groups, mode: .renderedOnly).map(\.standardizedFileURL.path) ==
+                groups.compactMap(\.renderedImageURL).map(\.standardizedFileURL.path)
+        )
+        #expect(
+            transfer.urlsForAirDrop(groups, mode: .rawOnly).map(\.standardizedFileURL.path) ==
+                groups.compactMap(\.rawURL).map(\.standardizedFileURL.path)
+        )
+        #expect(both.allSatisfy { FileManager.default.isReadableFile(atPath: $0.path) })
+    }
+
+    @Test("Filesystem delete target selection is ordered and non-destructive")
+    func filesystemDeleteTargetMatrix() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Photokichin-delete-selector-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let pairs: [(rendered: String, raw: String)] = [
+            ("JPG", "CR3"),
+            ("HIF", "CR3"),
+            ("JPG", "CR2"),
+            ("JPG", "ARW"),
+            ("JPG", "NEF"),
+            ("JPG", "RAF"),
+            ("JPG", "RW2"),
+            ("JPG", "ORF"),
+            ("JPG", "PEF"),
+            ("JPG", "DNG")
+        ]
+        for (index, pair) in pairs.enumerated() {
+            let directory = root.appendingPathComponent("PAIR_\(index)", isDirectory: true)
+            let rendered = directory.appendingPathComponent("IMG_\(index).\(pair.rendered)")
+            let raw = directory.appendingPathComponent("IMG_\(index).\(pair.raw)")
+            let group = PhotoGroup(
+                id: directory.appendingPathComponent("IMG_\(index)").path,
+                basename: "IMG_\(index)",
+                directory: directory,
+                renderedImageURL: rendered,
+                rawURL: raw,
+                movieURL: nil,
+                captureDate: nil,
+                metadata: .empty,
+                importedRenderedImage: false,
+                importedRAW: false,
+                isMetadataLoaded: true
+            )
+            let selected = FileTransferService.trashURLs(for: group)
+            #expect(selected.map(\.path) == [rendered.path, raw.path])
+            #expect(!FileManager.default.fileExists(atPath: rendered.path))
+            #expect(!FileManager.default.fileExists(atPath: raw.path))
+        }
+
+        let renderedOnly = PhotoGroup(
+            id: "rendered-only",
+            basename: "rendered-only",
+            directory: root,
+            renderedImageURL: root.appendingPathComponent("ONLY.JPG"),
+            rawURL: nil,
+            movieURL: nil,
+            captureDate: nil,
+            metadata: .empty,
+            importedRenderedImage: false,
+            importedRAW: false,
+            isMetadataLoaded: true
+        )
+        let rawOnly = PhotoGroup(
+            id: "raw-only",
+            basename: "raw-only",
+            directory: root,
+            renderedImageURL: nil,
+            rawURL: root.appendingPathComponent("ONLY.CR3"),
+            movieURL: nil,
+            captureDate: nil,
+            metadata: .empty,
+            importedRenderedImage: false,
+            importedRAW: false,
+            isMetadataLoaded: true
+        )
+        let empty = PhotoGroup(
+            id: "empty",
+            basename: "empty",
+            directory: root,
+            renderedImageURL: nil,
+            rawURL: nil,
+            movieURL: nil,
+            captureDate: nil,
+            metadata: .empty,
+            importedRenderedImage: false,
+            importedRAW: false,
+            isMetadataLoaded: true
+        )
+        #expect(FileTransferService.trashURLs(for: renderedOnly).map(\.lastPathComponent) == ["ONLY.JPG"])
+        #expect(FileTransferService.trashURLs(for: rawOnly).map(\.lastPathComponent) == ["ONLY.CR3"])
+        #expect(FileTransferService.trashURLs(for: empty).isEmpty)
+    }
+
     @Test("Catalog registration detects missing files and relinks candidates")
     func catalogRegistration() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Photokichin-catalog-\(UUID().uuidString)", isDirectory: true)

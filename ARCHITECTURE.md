@@ -25,9 +25,11 @@ PhotokichinApp
 
 Applicationのポートを実装します。SQLiteカタログ、ファイル探索と安全な転送、ImageIO、ImageCaptureCore、Disk Arbitration、AirDropの実装を置きます。`ICCameraDevice`、`ICCameraFile`、SQLiteハンドルはこのモジュールの外へ渡しません。
 
-形式とカメラ差分はInfrastructureのcontributionとして分離します。`MediaFormatRegistry`は拡張子からsemantic roleを解決し、`CameraSupportDefinition`は形式、ファイルシステム探索rule、metadata enricher、camera matcherを一つの薄い値として提供します。productionには`GenericMediaSupport`と`CanonCameraSupport`を明示登録します。`FilesystemTraversalPolicy`は登録されたruleを順に評価し、`MetadataEnrichmentPipeline`は標準ImageIO値を保ったままvendor補完の失敗を隔離します。`CameraIdentity`とmatcher／resolverはImageCaptureCoreが報告した値だけからsupport identifierを解決し、能力やI/Oの分岐は上書きしません。
+形式とカメラ差分はInfrastructureのcontributionとして分離します。`MediaFormatRegistry`は拡張子からsemantic roleを解決し、`CameraSupportDefinition`は形式、ファイルシステム探索rule、metadata enricher、camera matcherを一つの薄い値として提供します。productionの構成順は`GenericMediaSupport`、`CanonCameraSupport`、`SonyCameraSupport`、`NikonCameraSupport`、`FujifilmCameraSupport`、`PanasonicCameraSupport`、`OMSystemCameraSupport`、`PentaxCameraSupport`、`RicohCameraSupport`、`SigmaCameraSupport`です。GenericはJPEG／HEIF family、DNG、movieを所有し、CanonはCR3／CR2、その他のvendor contributionはそれぞれARW／NEF／RAF／RW2／ORF／PEFだけを所有します。RICOHとSIGMAはDNGを重複登録しません。`FilesystemTraversalPolicy`は登録されたruleを順に評価し、`MetadataEnrichmentPipeline`は標準ImageIO値を保ったままvendor補完の失敗を隔離します。`CameraIdentity`とmatcher／resolverはImageCaptureCoreが報告した値だけからsupport identifierを解決し、能力やI/Oの分岐は上書きしません。
 
 production compositionは`InfrastructureFactory`で一度だけ構成します。同じclassifierをカード、USBカメラ、ライブラリ検査へ注入し、同じmetadata pipelineをURL経路とUSB経路へ渡します。consumerはclassifier、traversal policy、resolver、reader、pipelineなどの狭い依存だけを受け取り、global singleton、service locator、runtime plugin、DI frameworkは使いません。vendor固有の拡張子、管理directory、MakerNoteキーは各contributionの中だけに置きます。
+
+分類とImageIO decode能力は別の契約です。classifierが形式を認識できることは、macOS ImageIOがその実ファイルのsource、thumbnail、metadataを成功させることを意味しません。OSが報告するreader identifierは環境の能力調査として記録し、実ファイル確認は独立したsample test入口で行います。形式を追加しても、Domainのrendered image／RAW／movieという3-slot、`AssetVariant`のlegacy rawValue（`JPG`／`CR3`／`動画`）、schema v3、SourceIdentity、photo ID、label UUIDの互換契約は変更しません。
 
 ### PhotokichinPresentation
 

@@ -4,7 +4,7 @@ Photokichin は、macOS で大量の写真、SD カード、USB 接続したカ�
 
 カメラのカードを接続したら、まず写真を一覧で確認し、必要な写真だけをライブラリへコピーできます。写真を撮影日ごとに並べ、現在は JPG と CR3 を同じ撮影単位として扱うため、カードの中身を確認しながら取り込み対象を決められます。
 
-現在は Canon EOS R の JPG／CR3 を中心に開発・検証しています。Sony を含む他メーカーのカメラにも対応する予定ですが、対応形式と動作確認の状況には差があります。詳しくは [対応形式とカメラ](#対応形式とカメラ) をご覧ください。
+Canon EOS R の JPG／CR3 を既存の第一級ワークフローとして維持しながら、複数メーカーの形式を同じ分類、グループ化、取り込み経路で扱います。コード上の認識、macOS ImageIO の能力、実ファイルの確認、実機 USB の確認は別のものです。詳しくは [対応形式とカメラ](#対応形式とカメラ) をご覧ください。
 
 > この README は、現在のソースコードで確認できる機能を基準にしています。バージョン 0.1.0 の開発用アドホック署名アプリであり、正式配布版ではありません。
 
@@ -65,24 +65,67 @@ Photokichin は、写真をアプリ独自の保管庫へ移すことだけを�
 
 ## 対応形式とカメラ
 
-### 現在の対応範囲
+### コードが認識する形式
 
-| 形式 | 現在の扱い | 確認状況 |
+拡張子の分類は、メーカー名を知らない共有 classifier が行います。画像と RAW は一つの撮影単位へまとめ、カタログには既存互換の `JPG`／`CR3` を保存します。DNG は Generic の定義だけが所有します。
+
+| コード上の形式 | semantic role | コード上の扱い |
 | --- | --- | --- |
-| `.jpg` / `.jpeg` | 一覧表示、サムネイル、メタデータ表示、取り込み、AirDrop、ゴミ箱への移動 | 対象形式。カメラメーカーごとの実機確認は継続中です。 |
-| `.cr3` | JPG と同じ撮影単位での表示、サムネイル、メタデータ表示、取り込み、AirDrop、ゴミ箱への移動 | Canon EOS R を主要な検証対象としています。 |
-| `.mov` / `.mp4` | 写真一覧の探索時に検出します | 現在の取り込み、AirDrop、ラベル、ゴミ箱操作の対象外です。 |
-| Canon の管理ファイル | 一覧に表示せず、読み書きしません | `CANONMSC` 以下を写真の探索対象から除外します。 |
+| `.jpg` / `.jpeg` | rendered image | カード、フォルダ、USB test double、ライブラリ検査、取り込み、AirDrop、ゴミ箱の共通経路 |
+| `.hif` / `.heif` / `.heic` | rendered image | 上記と同じ共通経路 |
+| `.cr3` / `.cr2` | RAW | Canon の contribution |
+| `.arw` / `.nef` / `.raf` / `.rw2` / `.orf` / `.pef` | RAW | 各メーカー contribution |
+| `.dng` | RAW | Generic のみ。PENTAX、RICOH、SIGMA は重複登録しません |
+| `.mov` / `.mp4` | movie | 探索時に分類しますが、現在の library inspection は対象外です |
+| `.nev` / `.x3f` | 未登録 | 対象外です |
 
-### 他メーカーのカメラについて
+### 現在の macOS ImageIO reader identifiers
 
-フォルダを選択して開く機能は、指定したフォルダを探索する機能です。フォルダを選択しただけで、対応する RAW 形式が自動的に増えるわけではありません。
+macOS 26.6 (Build 25G72) の実行環境で、`CGImageSourceCopyTypeIdentifiers()` が返した対象形式に関係する identifier を記録します。identifier が存在することは、すべての実ファイルの source、thumbnail、metadata decode が成功する証拠ではありません。観測した主な値は次のとおりです。
 
-現行版のソースコードがファイル名の拡張子として認識する形式は、`.jpg`、`.jpeg`、`.cr3`、`.mov`、`.mp4` です。そのため、Sony の `.jpg`／`.jpeg` は対象形式として扱えますが、Sony の RAW 形式である `.arw` は現行版では一覧に表示されません。`.nef`、`.raf`、`.rw2`、`.orf`、`.dng` など、その他の RAW 形式も同様です。
+```text
+com.adobe.raw-image
+com.canon.cr2-raw-image
+com.canon.cr3-raw-image
+com.fuji.raw-image
+com.nikon.nefx-raw-image
+com.nikon.nrw-raw-image
+com.nikon.raw-image
+com.olympus.or-raw-image
+com.olympus.raw-image
+com.olympus.sr-raw-image
+com.panasonic.raw-image
+com.panasonic.rw2-raw-image
+com.pentax.raw-image
+com.sony.arw-raw-image
+com.sony.axr-raw-image
+com.sony.raw-image
+com.sony.sr2-raw-image
+public.heic
+public.heics
+public.heif
+public.jpeg
+```
 
-JPG の標準的な EXIF 情報は macOS の ImageIO を使って読み取りますが、メーカーごとの RAW 形式やメーカー独自のメタデータには実機での確認が必要です。Sony を含む他メーカーの RAW 対応は今後の対応予定です。
+この観測結果に DNG、X3F、NEV の直接の reader identifier は含まれていません。DNG のコード上の分類登録と、OS による decode 能力は別の契約です。
 
-内部では、ファイル形式の分類とカメラメーカー固有の差分を Infrastructure の小さな拡張点へ分離しています。これは拡張可能な内部設計を示すもので、他メーカーの実形式に対応済みという意味ではありません。PR2 で NEF、ARW、RAF、HEIF などの実形式を登録し、各形式を実機と fixture で検証する予定です。
+### 実ファイルで確認した形式
+
+Canon EOS R の JPG／CR3 workflow は既存の第一級対応として維持しています。今回追加した形式については、実ファイルの preview／metadata 成功を確認済みとは記載しません。実ファイルを提供する場合は、`PHOTOKICHIN_IMAGEIO_SAMPLES` に `label=/absolute/path` を改行区切りで指定すると、独立したテスト入口から ImageIO source、thumbnail、撮影日時、メーカー、機種、レンズ、向き、寸法を確認できます。未指定時はこのテストを実行しません。
+
+### カード／フォルダ経路
+
+カードまたは任意のフォルダを選択すると、同じ classifier で画像、RAW、動画を分類します。カードのフォルダ名やメーカー名から形式を推測する規則は追加していません。Canon の `CANONMSC` 管理ディレクトリだけは既存の contribution により探索対象から除外します。
+
+### USB test double 経路
+
+USB の本番経路は ImageCaptureCore の値型 snapshot と共有 classifier を使います。自動テストでは test double によって追加形式の分類、グループ化、download 対象生成を確認しています。新メーカー固有の PTP／MTP 処理や、実機 USB の成功実績を追加したものではありません。
+
+### 実機 USB 確認済みの範囲
+
+EOS R5 Mark II については、既存の確認範囲である画像一覧とサムネイルの実機確認だけを記載します。Canon EOS R の JPG／CR3 は既存の主要 workflow ですが、今回の追加形式について他社実機を確認したとは報告しません。実機が利用可能になった形式だけを、同じ手順で別途確認します。
+
+HEIF は、機種、10-bit、HDR 方式によって macOS ImageIO の thumbnail／metadata 動作が異なる場合があります。コード上の対応形式、ImageIO identifier、実ファイル確認、USB 実機確認を混同しないでください。`.x3f` と `.nev` は今回の対象外です。
 
 ## 基本的な使い方
 
@@ -301,10 +344,11 @@ Finder で取り込み済みの写真を移動または削除した場合、履�
 ## 制限事項と今後の対応
 
 - 対応 OS は macOS 26 以上です。
-- 現在は Canon EOS R の JPG／CR3 を中心に実機確認しています。
+- Canon EOS R の JPG／CR3 を既存の第一級 workflow として維持しています。追加形式はコード上の共通 workflow 対応であり、実ファイルや実機での確認結果とは分けて記録します。
 - USB カメラは macOS の ImageCaptureCore が写真取り込みデバイスとして認識した機種を対象にしています。EOS R5 Mark II は画像一覧とサムネイルを実機確認済みで、カメラ内削除は `CanDeleteOneFile` とロック状態を確認してから実行します。
-- Sony の RAW（`.arw`）を含む他メーカーの RAW 形式は、現行版の一覧探索対象外です。
+- `.nev` と `.x3f` は対象外です。その他の対象形式はコード上で分類しますが、追加メーカーの実ファイル preview／metadata や実機 USB を確認済みとはしていません。
 - `.mov` と `.mp4` は一覧探索時に検出しますが、現在の取り込み、AirDrop、ラベル、ゴミ箱操作の対象外です。
+- HEIF は機種、10-bit、HDR 方式によって ImageIO の動作が異なる場合があります。
 - AirDrop 後の受信側アプリによる画像と RAW の統合は保証しません。
 - 現在の配布物は開発用のアドホック署名アプリです。正式な配布用署名とインストーラーは今後整備します。
 

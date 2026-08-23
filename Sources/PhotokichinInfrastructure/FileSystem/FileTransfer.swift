@@ -348,7 +348,7 @@ final class FileTransferService: FileTransferring, Sendable {
     }
 
     func moveGroupToTrash(_ group: PhotoGroup) throws {
-        let urls = [group.renderedImageURL, group.rawURL].compactMap { $0 }
+        let urls = Self.trashURLs(for: group)
         guard !urls.isEmpty else { throw AppError.noSelectedPhotos }
         for url in urls {
             do {
@@ -364,7 +364,7 @@ final class FileTransferService: FileTransferring, Sendable {
         onProgress: (@Sendable (Int, Int, Int, Int) -> Void)? = nil
     ) async -> TrashBatchResult {
         let totalFileCount = groups.reduce(0) { count, group in
-            count + [group.renderedImageURL, group.rawURL].compactMap { $0 }.count
+            count + Self.trashURLs(for: group).count
         }
         guard totalFileCount > 0 else {
             return TrashBatchResult(completedGroupIDs: [], movedFileCount: 0, failedFileCount: 0, errorMessage: nil)
@@ -378,7 +378,7 @@ final class FileTransferService: FileTransferring, Sendable {
         // one rendered-image+RAW group at a time so the UI can show real completed counts
         // while still making one OS call instead of one call per file.
         for (index, group) in groups.enumerated() {
-            let groupURLs = [group.renderedImageURL, group.rawURL].compactMap { $0 }
+            let groupURLs = Self.trashURLs(for: group)
             if groupURLs.isEmpty {
                 errorMessages.append("\(group.basename): ゴミ箱へ移動できる写真ファイルがありません")
                 onProgress?(index + 1, groups.count, movedPaths.count, totalFileCount)
@@ -402,6 +402,13 @@ final class FileTransferService: FileTransferring, Sendable {
             failedFileCount: max(0, totalFileCount - movedPaths.count),
             errorMessage: errorMessages.isEmpty ? nil : errorMessages.joined(separator: " / ")
         )
+    }
+
+    /// Returns filesystem deletion targets in the stable rendered-image then
+    /// RAW order. The same selector feeds the single-group and batch paths so
+    /// their target set cannot drift.
+    static func trashURLs(for group: PhotoGroup) -> [URL] {
+        [group.renderedImageURL, group.rawURL].compactMap { $0 }
     }
 
     private func recycle(_ urls: [URL]) async -> RecycleResult {
