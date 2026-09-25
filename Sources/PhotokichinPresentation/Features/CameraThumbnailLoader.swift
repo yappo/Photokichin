@@ -5,10 +5,25 @@ import PhotokichinDomain
 
 @MainActor
 final class CameraThumbnailCoordinator {
-    private struct Key: Hashable {
+    private nonisolated struct Key: Hashable {
         let cameraID: String
         let assetIdentifier: String
         let maxPixel: Int
+    }
+
+    private nonisolated final class CacheKey: NSObject {
+        let value: Key
+
+        init(_ value: Key) {
+            self.value = value
+        }
+
+        override var hash: Int { value.hashValue }
+
+        override func isEqual(_ object: Any?) -> Bool {
+            guard let other = object as? CacheKey else { return false }
+            return value == other.value
+        }
     }
 
     private final class Request {
@@ -36,7 +51,7 @@ final class CameraThumbnailCoordinator {
     private let cameraMonitor: any CameraMonitoring
     private let maxConcurrentLoads = 1
     private var nextSequence: UInt64 = 0
-    private var cache: [Key: NSImage] = [:]
+    private let cache = NSCache<CacheKey, NSImage>()
     private var queued: [Request] = []
     private var active: [Key: Request] = [:]
     private var observations: [UUID: Observation] = [:]
@@ -61,7 +76,7 @@ final class CameraThumbnailCoordinator {
         }
 
         let key = Key(cameraID: reference.cameraID, assetIdentifier: asset.identifier, maxPixel: maxPixel)
-        if let image = cache[key] {
+        if let image = cache.object(forKey: CacheKey(key)) {
             onImage(image)
             return nil
         }
@@ -164,7 +179,6 @@ final class CameraThumbnailCoordinator {
     }
 
     func removeCamera(id: String) {
-        for key in cache.keys.filter({ $0.cameraID == id }) { cache.removeValue(forKey: key) }
         for request in active.values where request.key.cameraID == id {
             request.observers.removeAll()
             request.task?.cancel()
@@ -214,8 +228,8 @@ final class CameraThumbnailCoordinator {
         active.removeValue(forKey: key)
         for observationID in request.observers.keys { observations.removeValue(forKey: observationID) }
         let image = data.flatMap(NSImage.init(data:))
-        if let image { cache[key] = image }
         let callbacks = Array(request.observers.values)
+        if let image { cache.setObject(image, forKey: CacheKey(key)) }
         for callback in callbacks { callback(image) }
         pump()
     }
