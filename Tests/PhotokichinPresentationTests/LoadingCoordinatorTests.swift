@@ -126,9 +126,212 @@ private nonisolated struct EmptyMediaReader: MediaReading {
     func thumbnailData(url: URL, maxPixel: Int) -> Data? { nil }
 }
 
+private struct CameraThumbnailRequestKey: Hashable {
+    let cameraID: String
+    let assetIdentifier: String
+    let maxPixel: Int
+}
+
+@MainActor
+private final class ThumbnailCameraMonitor: CameraMonitoring {
+    let imageData: Data
+    var thumbnailGate: LoadingGate<Data?>?
+    private(set) var requestCounts: [CameraThumbnailRequestKey: Int] = [:]
+
+    init(imageData: Data) {
+        self.imageData = imageData
+    }
+
+    var totalThumbnailRequests: Int {
+        requestCounts.values.reduce(0, +)
+    }
+
+    func requestCount(cameraID: String, assetIdentifier: String, maxPixel: Int) -> Int {
+        requestCounts[CameraThumbnailRequestKey(
+            cameraID: cameraID,
+            assetIdentifier: assetIdentifier,
+            maxPixel: maxPixel
+        ), default: 0]
+    }
+
+    func events() -> AsyncStream<CameraEvent> { AsyncStream { _ in } }
+    func start() {}
+    func descriptor(for id: String) -> CameraDescriptor? { nil }
+    func groups(for id: String) -> [PhotoGroup]? { nil }
+    func catalogSourceKey(for group: PhotoGroup, variant: AssetVariant) -> String {
+        "camera:test:\(group.id):\(variant.rawValue)"
+    }
+    func eject(id: String) async throws {}
+    func download(
+        group: PhotoGroup,
+        variant: AssetVariant,
+        to directory: URL,
+        filename requestedFilename: String?
+    ) async throws -> URL {
+        throw NSError(
+            domain: "PhotokichinTests",
+            code: 80,
+            userInfo: [NSLocalizedDescriptionKey: "this test camera has no downloadable files"]
+        )
+    }
+    func delete(group: PhotoGroup, variant: AssetVariant) async throws {}
+    func requestMetadata(for group: PhotoGroup) async -> PhotoMetadata? { nil }
+
+    func requestThumbnailData(for group: PhotoGroup, maxPixel: Int) async -> Data? {
+        guard let reference = group.cameraReference,
+              let asset = reference.asset(for: .renderedImage) ?? reference.asset(for: .raw) else {
+            return nil
+        }
+        let key = CameraThumbnailRequestKey(
+            cameraID: reference.cameraID,
+            assetIdentifier: asset.identifier,
+            maxPixel: maxPixel
+        )
+        requestCounts[key, default: 0] += 1
+        if let thumbnailGate {
+            return await thumbnailGate.run()
+        }
+        return imageData
+    }
+}
+
 @MainActor
 @Suite("Loading coordinators")
 struct LoadingCoordinatorTests {
+    @Test("Camera thumbnail cache hit avoids a second camera request")
+    func cameraThumbnailCacheHit() async throws {
+        let imageData = try #require(Data(base64Encoded: imageBase64))
+        let monitor = ThumbnailCameraMonitor(imageData: imageData)
+        let coordinator = CameraThumbnailCoordinator(cameraMonitor: monitor)
+        let group = makeCameraLoadingGroup()
+        let firstSignal = TestSignal()
+
+        let firstID = coordinator.subscribe(
+            group: group,
+            maxPixel: 320,
+            priority: .visible,
+            onImage: { image in
+                if image != nil { firstSignal.signal() }
+            }
+        )
+        #expect(firstID != nil)
+        await firstSignal.wait(for: 1)
+        #expect(monitor.totalThumbnailRequests == 1)
+
+        var secondImage: NSImage?
+        let secondID = coordinator.subscribe(
+            group: group,
+            maxPixel: 320,
+            priority: .visible,
+            onImage: { secondImage = $0 }
+        )
+        #expect(secondID == nil)
+        #expect(secondImage != nil)
+        #expect(monitor.totalThumbnailRequests == 1)
+    }
+
+    @Test("Camera thumbnail subscriptions share one request after one observer cancels")
+    func cameraThumbnailSharedRequestCancellation() async throws {
+        let imageData = try #require(Data(base64Encoded: imageBase64))
+        let monitor = ThumbnailCameraMonitor(imageData: imageData)
+        let gate = LoadingGate<Data?>()
+        monitor.thumbnailGate = gate
+        let coordinator = CameraThumbnailCoordinator(cameraMonitor: monitor)
+        let group = makeCameraLoadingGroup()
+        let firstSignal = TestSignal()
+        let secondSignal = TestSignal()
+
+        var firstImage = false
+        var secondImage = false
+        let firstID = coordinator.subscribe(
+            group: group,
+            maxPixel: 320,
+            priority: .visible,
+            onImage: { image in
+                firstImage = image != nil
+                firstSignal.signal()
+            }
+        )
+        #expect(firstID != nil)
+        await gate.waitUntilStarted()
+
+        let secondID = coordinator.subscribe(
+            group: group,
+            maxPixel: 320,
+            priority: .viewerNeighbor,
+            onImage: { image in
+                secondImage = image != nil
+                secondSignal.signal()
+            }
+        )
+        #expect(secondID != nil)
+        if let firstID { coordinator.cancel(firstID) }
+
+        gate.finish(imageData)
+        await secondSignal.wait(for: 1)
+        #expect(monitor.totalThumbnailRequests == 1)
+        #expect(firstSignal.value == 0)
+        #expect(!firstImage)
+        #expect(secondImage)
+    }
+
+    @Test("Camera thumbnail cache identity includes camera, asset, and pixel size")
+    func cameraThumbnailCacheIdentity() async throws {
+        let imageData = try #require(Data(base64Encoded: imageBase64))
+        let monitor = ThumbnailCameraMonitor(imageData: imageData)
+        let coordinator = CameraThumbnailCoordinator(cameraMonitor: monitor)
+        let requests: [(PhotoGroup, Int)] = [
+            (makeCameraLoadingGroup(cameraID: "camera-a", assetIdentifier: "asset-a"), 320),
+            (makeCameraLoadingGroup(cameraID: "camera-a", assetIdentifier: "asset-a"), 640),
+            (makeCameraLoadingGroup(cameraID: "camera-b", assetIdentifier: "asset-a"), 320),
+            (makeCameraLoadingGroup(cameraID: "camera-a", assetIdentifier: "asset-b"), 320)
+        ]
+
+        for (group, maxPixel) in requests {
+            let signal = TestSignal()
+            let requestID = coordinator.subscribe(
+                group: group,
+                maxPixel: maxPixel,
+                priority: .visible,
+                onImage: { image in
+                    if image != nil { signal.signal() }
+                }
+            )
+            #expect(requestID != nil)
+            await signal.wait(for: 1)
+        }
+
+        #expect(monitor.totalThumbnailRequests == 4)
+        #expect(monitor.requestCount(cameraID: "camera-a", assetIdentifier: "asset-a", maxPixel: 320) == 1)
+        #expect(monitor.requestCount(cameraID: "camera-a", assetIdentifier: "asset-a", maxPixel: 640) == 1)
+        #expect(monitor.requestCount(cameraID: "camera-b", assetIdentifier: "asset-a", maxPixel: 320) == 1)
+        #expect(monitor.requestCount(cameraID: "camera-a", assetIdentifier: "asset-b", maxPixel: 320) == 1)
+    }
+
+    @Test("Camera thumbnail cache miss requests and publishes the image")
+    func cameraThumbnailCacheMiss() async throws {
+        let imageData = try #require(Data(base64Encoded: imageBase64))
+        let monitor = ThumbnailCameraMonitor(imageData: imageData)
+        let coordinator = CameraThumbnailCoordinator(cameraMonitor: monitor)
+        let group = makeCameraLoadingGroup()
+        let signal = TestSignal()
+        var receivedImage = false
+
+        let requestID = coordinator.subscribe(
+            group: group,
+            maxPixel: 320,
+            priority: .visible,
+            onImage: { image in
+                receivedImage = image != nil
+                signal.signal()
+            }
+        )
+        #expect(requestID != nil)
+        await signal.wait(for: 1)
+        #expect(receivedImage)
+        #expect(monitor.totalThumbnailRequests == 1)
+    }
+
     @Test("Already-loaded and URL-less metadata are delivered immediately")
     func metadataImmediateHandling() async throws {
         let coordinator = MetadataLoadingCoordinator(mediaReader: EmptyMediaReader())
@@ -407,5 +610,38 @@ struct LoadingCoordinatorTests {
 
     private func makeLoadingGroup(root: URL, id: String, path: String?, isMetadataLoaded: Bool = false, metadata: PhotoMetadata = .empty) -> PhotoGroup {
         PhotoGroup(id: id, basename: path.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? id, directory: root, renderedImageURL: path.map { root.appendingPathComponent($0) }, rawURL: nil, movieURL: nil, captureDate: nil, metadata: metadata, importedRenderedImage: false, importedRAW: false, isMetadataLoaded: isMetadataLoaded)
+    }
+
+    private func makeCameraLoadingGroup(
+        cameraID: String = "camera-a",
+        assetIdentifier: String = "asset-a"
+    ) -> PhotoGroup {
+        let reference = CameraPhotoReference(
+            cameraID: cameraID,
+            groupKey: "group-\(assetIdentifier)",
+            assets: [
+                CameraAssetReference(
+                    identifier: assetIdentifier,
+                    filename: "IMG_0001.JPG",
+                    variant: .renderedImage,
+                    fileSize: 1,
+                    captureDate: nil
+                )
+            ]
+        )
+        return PhotoGroup(
+            id: "camera:\(cameraID):\(assetIdentifier)",
+            basename: "IMG_0001",
+            directory: URL(fileURLWithPath: "/__photokichin_camera__"),
+            renderedImageURL: nil,
+            rawURL: nil,
+            movieURL: nil,
+            captureDate: nil,
+            metadata: .empty,
+            importedRenderedImage: false,
+            importedRAW: false,
+            isMetadataLoaded: false,
+            cameraReference: reference
+        )
     }
 }
